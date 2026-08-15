@@ -34,12 +34,27 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired token' })
   }
 
-  // Fetch role from profiles table
-  const { data: profile } = await supabase
+  // Fetch role from profiles table using auth_id (UUID) column.
+  // profiles.id is a text slug; auth_id links to auth.users.id (UUID).
+  // Falls back to querying by id in case the profile was created with UUID as id (test users).
+  let profile = null
+  const { data: profileByAuthId } = await supabase
     .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single()
+    .select('role, id')
+    .eq('auth_id', user.id)
+    .maybeSingle()
+
+  if (profileByAuthId) {
+    profile = profileByAuthId
+  } else {
+    // Fallback: some profiles (e.g. test users) have UUID stored as id
+    const { data: profileById } = await supabase
+      .from('profiles')
+      .select('role, id')
+      .eq('id', user.id)
+      .maybeSingle()
+    profile = profileById
+  }
 
   req.userId    = user.id
   req.userEmail = user.email

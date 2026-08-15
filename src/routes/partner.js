@@ -355,4 +355,91 @@ router.post('/team/invite', async (req, res) => {
   }
 })
 
+// ── GET /api/partner/linked-submissions ──────────────────────────────────────
+// Partner sees all submissions where they are the linked partner (partner_user_id = me)
+router.get('/linked-submissions', async (req, res) => {
+  try {
+    const userId = req.userId
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' })
+
+    const { data, error } = await supabase
+      .from('project_submissions')
+      .select(`
+        id, title, element, category, location, start_date, end_date, tree_count,
+        partner_type, partner_name, partner_role,
+        partner_review_status, partner_review_notes, partner_reviewed_at,
+        status, submitted_by, submitted_at, outcome,
+        evidence_files(id, file_name, file_type, file_size, file_url, storage_path)
+      `)
+      .eq('partner_user_id', userId)
+      .order('submitted_at', { ascending: false })
+      .limit(50)
+
+    if (error) throw error
+
+    res.json({ submissions: data || [] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── PATCH /api/partner/linked-submissions/:id/review ─────────────────────────
+// Partner approves or rejects a submission linked to them
+// Body: { action: 'approve'|'reject', reviewNotes?: string }
+router.patch('/linked-submissions/:id/review', async (req, res) => {
+  try {
+    const userId = req.userId
+    const { id } = req.params
+    const { action, reviewNotes } = req.body
+
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' })
+    if (!['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ error: 'action must be approve or reject' })
+    }
+
+    // Verify this submission is actually linked to this partner
+    const { data: sub, error: fetchErr } = await supabase
+      .from('project_submissions')
+      .select('id, partner_user_id, submitted_by, title')
+      .eq('id', id)
+      .single()
+
+    if (fetchErr || !sub) return res.status(404).json({ error: 'Submission not found' })
+    if (sub.partner_user_id !== userId) {
+      return res.status(403).json({ error: 'Forbidden — this submission is not linked to you' })
+    }
+
+    const { error: updateErr } = await supabase
+      .from('project_submissions')
+      .update({
+        partner_review_status: action === 'approve' ? 'approved' : 'rejected',
+        partner_review_notes:  reviewNotes || null,
+        partner_reviewed_at:   new Date().toISOString(),
+      })
+      .eq('id', id)
+
+    if (updateErr) throw new Error(updateErr.message)
+
+    // Notify the submitter of the partner's decision
+    if (sub.submitted_by) {
+      const { createNotification } = require('./notifications')
+      await createNotification({
+        userId: sub.submitted_by,
+        type:   action === 'approve' ? 'partner_corroborated' : 'partner_disputed',
+        title:  action === 'approve'
+          ? 'Partner has corroborated your submission ✅'
+          : 'Partner has raised a concern about your submission',
+        body:   reviewNotes || (action === 'approve'
+          ? `The partner linked to "${sub.title}" has confirmed the work.`
+          : `The partner linked to "${sub.title}" has flagged a concern. The admin will review.`),
+        link:   '/submit-project/review',
+      })
+    }
+
+    res.json({ success: true, partnerReviewStatus: action === 'approve' ? 'approved' : 'rejected' })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 module.exports = router

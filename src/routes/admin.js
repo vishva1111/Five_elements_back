@@ -12,12 +12,24 @@ async function requireAdmin(req, res, next) {
   const { data: { user }, error } = await supabase.auth.getUser(token)
   if (error || !user) return res.status(401).json({ error: 'Unauthorized' })
 
-  // Check role in profiles table
-  const { data: profile } = await supabase
+  // Check role in profiles table — try auth_id first, fall back to id (for test users with UUID as id)
+  let profile = null
+  const { data: byAuthId } = await supabase
     .from('profiles')
     .select('role')
-    .eq('id', user.id)
-    .single()
+    .eq('auth_id', user.id)
+    .maybeSingle()
+
+  if (byAuthId) {
+    profile = byAuthId
+  } else {
+    const { data: byId } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', user.id)
+      .maybeSingle()
+    profile = byId
+  }
 
   if (!profile || profile.role !== 'admin') {
     return res.status(403).json({ error: 'Forbidden — admin only' })
@@ -328,7 +340,143 @@ router.patch('/partners/:id', requireAdmin, async (req, res) => {
   }
 })
 
-// ─── A4: Users & tenants ──────────────────────────────────────────────────────
+// ─── A4: Submission review (CARM flow) ───────────────────────────────────────
+
+// GET /api/admin/submissions — list all pending_review submissions with evidence files
+router.get('/submissions', requireAdmin, async (req, res) => {
+  try {
+    const { status = 'pending_review' } = req.query
+
+    const { data, error } = await supabase
+      .from('project_submissions')
+      .select(`
+        id, title, element, category, project_type, location,
+        start_date, end_date, tree_count, description,
+        partner_type, partner_name, partner_contact, partner_role, partner_user_id,
+        partner_review_status, partner_review_notes, partner_reviewed_at,
+        status, submitted_by, submitted_at, reviewed_by, reviewed_at, review_notes,
+        outcome, more_info_request, more_info_response,
+        evidence_files(id, file_name, file_type, file_size, file_url, storage_path)
+      `)
+      .eq('status', status)
+      .order('submitted_at', { ascending: true })
+      .limit(100)
+
+    if (error) throw error
+
+    res.json({ submissions: data || [] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /api/admin/submissions/:id — get single submission detail
+router.get('/submissions/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+
+    const { data, error } = await supabase
+      .from('project_submissions')
+      .select(`
+        id, title, element, category, project_type, location,
+        start_date, end_date, tree_count, description,
+        partner_type, partner_name, partner_contact, partner_role, partner_user_id,
+        partner_review_status, partner_review_notes, partner_reviewed_at,
+        status, submitted_by, submitted_at, reviewed_by, reviewed_at, review_notes,
+        outcome, more_info_request, more_info_response,
+        evidence_files(id, file_name, file_type, file_size, file_url, storage_path)
+      `)
+      .eq('id', id)
+      .single()
+
+    if (error || !data) return res.status(404).json({ error: 'Submission not found' })
+
+    res.json({ submission: data })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// PATCH /api/admin/submissions/:id/review — approve, reject, or request more info
+// Body: { action: 'approve'|'reject'|'more_info', outcome?: 'verified'|'self_reported', reviewNotes?: string, moreInfoRequest?: string }
+router.patch('/submissions/:id/review', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { action, outcome, reviewNotes, moreInfoRequest } = req.body
+
+    if (!['approve', 'reject', 'more_info'].includes(action)) {
+      return res.status(400).json({ error: 'action must be approve, reject, or more_info' })
+    }
+
+    // Fetch submission to get submitter id
+    const { data: sub, error: fetchErr } = await supabase
+      .from('project_submissions')
+      .select('id, submitted_by, title, partner_user_id')
+      .eq('id', id)
+      .single()
+
+    if (fetchErr || !sub) return res.status(404).json({ error: 'Submission not found' })
+
+    let updatePayload = {
+      reviewed_by:  req.adminId,
+      reviewed_at:  new Date().toISOString(),
+      review_notes: reviewNotes || null,
+    }
+
+    if (action === 'approve') {
+      updatePayload.status  = 'approved'
+      updatePayload.outcome = outcome || 'self_reported'
+    } else if (action === 'reject') {
+      updatePayload.status  = 'rejected'
+      updatePayload.outcome = 'rejected'
+    } else if (action === 'more_info') {
+      updatePayload.status             = 'more_info'
+      updatePayload.more_info_request  = moreInfoRequest || reviewNotes || ''
+    }
+
+    const { error: updateErr } = await supabase
+      .from('project_submissions')
+      .update(updatePayload)
+      .eq('id', id)
+
+    if (updateErr) throw new Error(updateErr.message)
+
+    // Notify submitter
+    if (sub.submitted_by) {
+      if (action === 'approve') {
+        await createNotification({
+          userId: sub.submitted_by,
+          type:   'submission_approved',
+          title:  `Your project has been ${updatePayload.outcome === 'verified' ? 'Verified ✅' : 'approved as Self-reported'}`,
+          body:   reviewNotes || `"${sub.title}" has been reviewed and approved.`,
+          link:   '/impact',
+        })
+      } else if (action === 'reject') {
+        await createNotification({
+          userId: sub.submitted_by,
+          type:   'submission_rejected',
+          title:  'Project submission not approved ❌',
+          body:   reviewNotes || `"${sub.title}" was not approved. Please review the feedback and resubmit.`,
+          link:   '/submit-project/details',
+        })
+      } else if (action === 'more_info') {
+        await createNotification({
+          userId: sub.submitted_by,
+          type:   'submission_more_info',
+          title:  'More information needed for your submission',
+          body:   moreInfoRequest || `The reviewer has a question about "${sub.title}".`,
+          link:   '/submit-project/review',
+        })
+      }
+    }
+
+    res.json({ success: true, status: updatePayload.status, outcome: updatePayload.outcome || null })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─── A5: Users & tenants ──────────────────────────────────────────────────────
 // GET /api/admin/users
 router.get('/users', requireAdmin, async (req, res) => {
   try {
