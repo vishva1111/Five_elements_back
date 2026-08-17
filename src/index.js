@@ -2,6 +2,7 @@ const express = require('express')
 const cors = require('cors')
 require('dotenv').config()
 
+const authRouter        = require('./routes/auth')
 const projectsRouter    = require('./routes/projects')
 const fundRouter        = require('./routes/fund')
 const dashboardRouter   = require('./routes/dashboard')
@@ -40,6 +41,7 @@ app.get('/', (req, res) => {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 // Public — no auth required
+app.use('/api/auth',       authRouter)
 app.use('/api/projects',   projectsRouter)
 app.use('/api/profiles',   profilesRouter)
 
