@@ -33,11 +33,12 @@ app.use(cors({
       'http://localhost:3001',
       'http://localhost:4173',
     ].filter(Boolean)
-    // Allow any vercel.app or onrender.com subdomain
+    // Allow any vercel.app, onrender.com, or fiveelements.tech subdomain
     if (
       allowed.includes(origin) ||
       /\.vercel\.app$/.test(origin) ||
-      /\.onrender\.com$/.test(origin)
+      /\.onrender\.com$/.test(origin) ||
+      /^https?:\/\/(www\.)?fiveelements\.tech$/.test(origin)
     ) {
       return callback(null, true)
     }
