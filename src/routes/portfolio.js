@@ -11,7 +11,7 @@ router.get('/', async (req, res) => {
     // Fetch all projects (funded ones for this org)
     const { data: projects, error: projErr } = await supabase
       .from('projects')
-      .select('id, name, element, category, partner, location, country, funded_trees, total_trees, tco2e, verified, status, certification, funded_amount, verification_status, has_ledger_entry, ledger_entry_id')
+      .select('id, name, element, category, partner, location, country, funded_trees, total_trees, tco2e, verified, status, certification, funded_amount, verification_status, has_ledger_entry')
       .order('funded_amount', { ascending: false })
 
     if (projErr) throw projErr
@@ -47,7 +47,7 @@ router.get('/', async (req, res) => {
         verificationStatus: verStatus,
         standard:           p.certification || 'Verra VCS',
         hasLedgerEntry:     p.has_ledger_entry || false,
-        ledgerEntryId:      p.ledger_entry_id || null,
+        ledgerEntryId:      null,
         tco2e:              parseFloat(p.tco2e || 0).toFixed(0),
       }
     })
