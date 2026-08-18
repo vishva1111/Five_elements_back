@@ -19,14 +19,14 @@ router.get('/:id', async (req, res) => {
       .from('individual_fundings')
       .select(`
         id,
+        user_id,
         certificate_id,
         trees_funded,
         funded_at,
         ledger_entry_id,
         verification_code,
-        profiles (
-          display_name
-        ),
+        funder_name,
+        public_attribution,
         projects (
           name,
           element,
@@ -42,13 +42,23 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Certificate not found' })
     }
 
+    // Fetch display name from profiles via auth_id
+    let displayName = data.funder_name || 'Anonymous'
+    if (data.public_attribution && data.user_id) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('display_name')
+        .eq('auth_id', data.user_id)  
+        .maybeSingle()
+      if (profile?.display_name) displayName = profile.display_name
+    }
+
     const p = data.projects || {}
-    const profile = data.profiles || {}
     const tco2e = ((data.trees_funded || 0) * 0.017).toFixed(2)
 
     res.json({
       id:               data.certificate_id,
-      recipientName:    profile.display_name || 'Anonymous',
+      recipientName:    displayName,
       projectName:      p.name || 'Unknown project',
       element:          p.element || 'earth',
       partner:          p.partner || '',

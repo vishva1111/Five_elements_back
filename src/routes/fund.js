@@ -29,6 +29,7 @@ router.post('/', async (req, res) => {
       funderName = 'Anonymous',
       paymentMethod = 'card',
       publicAttribution = true,
+      userId = null,
     } = req.body
 
     // ── Validate input ────────────────────────────────────────────────────────
@@ -97,6 +98,29 @@ router.post('/', async (req, res) => {
     if (updateErr) {
       // Non-fatal — ledger entry was created, just log the counter update failure
       console.error('[POST /api/fund] project update error:', updateErr.message)
+    }
+
+    // ── Insert individual_fundings row (if userId provided) ───────────────────
+    if (userId) {
+      const amountPaid = trees * (project.price_per_tree || 100) * 1.1 // includes 10% platform fee
+      const { error: fundingErr } = await supabase
+        .from('individual_fundings')
+        .insert({
+          user_id: userId,
+          project_id: project.id,
+          trees_funded: trees,
+          amount_paid: Math.round(amountPaid),
+          funded_at: new Date().toISOString(),
+          verification_status: 'pending',
+          has_ledger_entry: true,
+          ledger_entry_id: null, // ledger entry id is a text field, not uuid — skip FK
+          public_attribution: publicAttribution,
+          funder_name: publicAttribution ? funderName : 'Anonymous',
+        })
+      if (fundingErr) {
+        console.error('[POST /api/fund] individual_fundings insert error:', fundingErr.message)
+        // Non-fatal for demo
+      }
     }
 
     // ── Respond ───────────────────────────────────────────────────────────────
