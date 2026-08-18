@@ -23,27 +23,31 @@ router.post('/signup', async (req, res) => {
 
   let authData, authErr
   if (hasServiceRole) {
-    // Admin API — can create users without email confirmation
+    // Admin API — auto-confirm email so user can log in immediately
     const result = await supabase.auth.admin.createUser({
       email,
       password,
-      email_confirm: false,
+      email_confirm: true,
       user_metadata: { display_name: fullName.trim() },
     })
     authData = result.data
     authErr  = result.error
   } else {
-    // Anon signUp — sends confirmation email
+    // Anon signUp — sends confirmation email with redirect back to /welcome
     const { createClient } = require('@supabase/supabase-js')
     const anonClient = createClient(
       process.env.SUPABASE_URL,
       process.env.SUPABASE_ANON_KEY,
       { auth: { autoRefreshToken: false, persistSession: false } }
     )
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
     const result = await anonClient.auth.signUp({
       email,
       password,
-      options: { data: { display_name: fullName.trim() } },
+      options: {
+        data: { display_name: fullName.trim() },
+        emailRedirectTo: `${frontendUrl}/welcome`,
+      },
     })
     authData = result.data
     authErr  = result.error
@@ -65,12 +69,18 @@ router.post('/signup', async (req, res) => {
   const { error: profileErr } = await supabase
     .from('profiles')
     .insert({
-      id:            profileId,
-      auth_id:       userId,
-      display_name:  fullName.trim(),
-      email,
-      role:          'individual',
+      id:             profileId,
+      auth_id:        userId,
+      display_name:   fullName.trim(),
+      name:           fullName.trim(),
+      type:           'Individual',
+      location:       '',
+      avatar:         '',
+      trees:          0,
+      t_co2e:         0,
+      role:           'individual',
       is_first_login: true,
+      status:         'active',
     })
 
   if (profileErr) {
