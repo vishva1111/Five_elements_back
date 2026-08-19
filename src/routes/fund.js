@@ -29,8 +29,10 @@ router.post('/', async (req, res) => {
       funderName = 'Anonymous',
       paymentMethod = 'card',
       publicAttribution = true,
-      userId = null,
     } = req.body
+
+    // userId comes from the verified JWT via requireAuth middleware
+    const userId = req.userId || req.body.userId || null
 
     // ── Validate input ────────────────────────────────────────────────────────
     if (!projectId || typeof projectId !== 'string') {
@@ -40,15 +42,32 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'trees must be a positive number' })
     }
 
-    // ── Fetch project ─────────────────────────────────────────────────────────
-    const { data: project, error: projectErr } = await supabase
+    // ── Fetch project (try slug first, then id) ───────────────────────────────
+    let project = null
+    let projectErr = null
+
+    // Try by slug
+    const bySlug = await supabase
       .from('projects')
       .select('id, slug, name, status, price_per_tree, funded_trees, funders_count, tco2e, total_trees')
-      .or(`slug.eq.${projectId},id.eq.${projectId}`)
-      .single()
+      .eq('slug', projectId)
+      .maybeSingle()
+
+    if (bySlug.data) {
+      project = bySlug.data
+    } else {
+      // Try by UUID id
+      const byId = await supabase
+        .from('projects')
+        .select('id, slug, name, status, price_per_tree, funded_trees, funders_count, tco2e, total_trees')
+        .eq('id', projectId)
+        .maybeSingle()
+      project = byId.data
+      projectErr = byId.error
+    }
 
     if (projectErr || !project) {
-      return res.status(404).json({ error: 'Project not found' })
+      return res.status(404).json({ error: 'Project not found', projectId })
     }
 
     if (project.status !== 'active') {
