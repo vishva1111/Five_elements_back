@@ -7,7 +7,8 @@ const supabase = require('../supabaseClient')
 // 1. Creates auth user via Supabase Admin API
 // 2. Inserts a profile row with role = 'individual'
 router.post('/signup', async (req, res) => {
-  const { fullName, email, password } = req.body
+  const { fullName, email, password, role } = req.body
+  const requestedRole = (role === 'business') ? 'business' : 'individual'
 
   if (!fullName || !email || !password) {
     return res.status(400).json({ error: 'fullName, email and password are required.' })
@@ -54,10 +55,39 @@ router.post('/signup', async (req, res) => {
   }
 
   if (authErr) {
-    // Friendly duplicate-email message
+    // If email already registered, try to add the new role to existing profile
     if (authErr.message?.toLowerCase().includes('already registered') ||
         authErr.message?.toLowerCase().includes('already exists')) {
-      return res.status(409).json({ error: 'An account with this email already exists.' })
+      // Fetch existing profile by email via auth admin (service role required)
+      if (hasServiceRole) {
+        const { data: listData } = await supabase.auth.admin.listUsers()
+        const existingUser = listData?.users?.find(u => u.email?.toLowerCase() === email.toLowerCase())
+        if (existingUser) {
+          // Add new role to roles array if not already present
+          const { data: existingProfile } = await supabase
+            .from('profiles')
+            .select('roles')
+            .eq('auth_id', existingUser.id)
+            .maybeSingle()
+          const currentRoles = existingProfile?.roles || ['individual']
+          if (!currentRoles.includes(requestedRole)) {
+            const newRoles = [...currentRoles, requestedRole]
+            await supabase
+              .from('profiles')
+              .update({ roles: newRoles })
+              .eq('auth_id', existingUser.id)
+            return res.status(200).json({
+              message: `${requestedRole} access added to your account.`,
+              userId: existingUser.id,
+              emailConfirmationRequired: false,
+              roleAdded: true,
+            })
+          } else {
+            return res.status(409).json({ error: `You already have ${requestedRole} access with this email.` })
+          }
+        }
+      }
+      return res.status(409).json({ error: 'An account with this email already exists. Please log in.' })
     }
     return res.status(400).json({ error: authErr.message })
   }
@@ -78,7 +108,8 @@ router.post('/signup', async (req, res) => {
       avatar:         '',
       trees:          0,
       t_co2e:         0,
-      role:           'individual',
+      role:           requestedRole,
+      roles:          [requestedRole],
       is_first_login: true,
       status:         'active',
     })
