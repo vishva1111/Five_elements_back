@@ -1,6 +1,7 @@
 const express = require('express')
 const router  = express.Router()
 const supabase = require('../supabaseClient')
+const { sendWelcomeEmail, sendRoleAddedEmail } = require('../services/emailService')
 
 // ── POST /api/auth/signup ─────────────────────────────────────────────────────
 // Body: { fullName, email, password }
@@ -76,12 +77,18 @@ router.post('/signup', async (req, res) => {
               .from('profiles')
               .update({ roles: newRoles })
               .eq('auth_id', existingUser.id)
-            return res.status(200).json({
-              message: `${requestedRole} access added to your account.`,
-              userId: existingUser.id,
-              emailConfirmationRequired: false,
-              roleAdded: true,
+            // Send role-added notification email
+            await sendRoleAddedEmail({
+              toEmail:     email,
+              displayName: existingUser.user_metadata?.display_name || fullName.trim(),
+              newRole:     requestedRole,
             })
+            return res.status(200).json({
+                              message: `${requestedRole} access added to your account.`,
+                              userId: existingUser.id,
+                              emailConfirmationRequired: false,
+                              roleAdded: true,
+                            })
           } else {
             return res.status(409).json({ error: `You already have ${requestedRole} access with this email.` })
           }
@@ -118,6 +125,13 @@ router.post('/signup', async (req, res) => {
     // Non-fatal — auth user created, profile can be created on first login
     console.warn('[signup] Profile insert failed:', profileErr.message)
   }
+
+  // Send welcome email (non-fatal — signup still succeeds if email fails)
+  await sendWelcomeEmail({
+    toEmail:     email,
+    displayName: fullName.trim(),
+    role:        requestedRole,
+  })
 
   return res.status(201).json({
     message: 'Account created successfully.',
