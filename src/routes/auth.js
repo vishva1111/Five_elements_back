@@ -118,7 +118,7 @@ router.post('/signup', async (req, res) => {
       role:           requestedRole,
       roles:          [requestedRole],
       is_first_login: true,
-      status:         'active',
+      status:         'pending',
     })
 
   if (profileErr) {
