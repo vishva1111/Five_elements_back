@@ -166,11 +166,11 @@ router.post('/upload', upload.array('files', 40), async (req, res) => {
       }
     }
 
-    // Update file_count on the submission
+    // Update file_count on the submission with the number of successfully uploaded files
     const successCount = results.filter(r => r.ok).length
     await supabase
       .from('project_submissions')
-      .update({ file_count: supabase.rpc ? undefined : successCount })
+      .update({ file_count: successCount })
       .eq('id', submissionId)
 
     res.status(200).json({ uploaded: successCount, total: req.files.length, results })

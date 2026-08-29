@@ -31,8 +31,9 @@ router.post('/', async (req, res) => {
       publicAttribution = true,
     } = req.body
 
-    // userId comes from the verified JWT via requireAuth middleware
-    const userId = req.userId || req.body.userId || null
+    // userId comes exclusively from the verified JWT via requireAuth middleware.
+    // Never trust req.body.userId — it could be spoofed by the caller.
+    const userId = req.userId || null
 
     // ── Validate input ────────────────────────────────────────────────────────
     if (!projectId || typeof projectId !== 'string') {
@@ -104,19 +105,24 @@ router.post('/', async (req, res) => {
       return res.status(500).json({ error: 'Failed to record funding', detail: insertErr.message })
     }
 
-    // ── Update project counters ───────────────────────────────────────────────
-    const { error: updateErr } = await supabase
-      .from('projects')
-      .update({
-        funded_trees: (project.funded_trees || 0) + trees,
-        funders_count: (project.funders_count || 0) + 1,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', project.id)
+    // ── Update project counters (atomic SQL increment — avoids race conditions) ─
+    // Uses raw Postgres increment so concurrent requests don't overwrite each other.
+    const { error: updateErr } = await supabase.rpc('increment_project_funding', {
+      p_project_id:  project.id,
+      p_trees_delta: trees,
+    })
 
     if (updateErr) {
-      // Non-fatal — ledger entry was created, just log the counter update failure
-      console.error('[POST /api/fund] project update error:', updateErr.message)
+      // Fallback: if the RPC doesn't exist yet, use a non-atomic update (log warning)
+      console.warn('[POST /api/fund] RPC increment_project_funding not found, falling back to non-atomic update:', updateErr.message)
+      await supabase
+        .from('projects')
+        .update({
+          funded_trees:  (project.funded_trees || 0) + trees,
+          funders_count: (project.funders_count || 0) + 1,
+          updated_at:    new Date().toISOString(),
+        })
+        .eq('id', project.id)
     }
 
     // ── Insert individual_fundings row (if userId provided) ───────────────────

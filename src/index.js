@@ -71,8 +71,8 @@ app.use('/api/my-projects',    requireAuth, myProjectsRouter)
 app.use('/api/submit-project', requireAuth, submitProjectRouter)
 app.use('/api/partner',       requireAuth, partnerRouter)
 
-// Admin — role check is done inside the router itself (requireAdmin middleware)
-app.use('/api/admin',         adminRouter)
+// Admin — requireAuth verifies JWT first; role check (admin-only) is inside the router
+app.use('/api/admin',         requireAuth, adminRouter)
 
 // Notifications — auth checked inside router
 app.use('/api/notifications', notificationsRouter)
