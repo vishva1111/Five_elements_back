@@ -143,33 +143,45 @@ router.post('/signup', async (req, res) => {
 // ── POST /api/auth/login ──────────────────────────────────────────────────────
 // Body: { email, password }
 // Returns: { session, user }
-// Note: Login is typically handled client-side via Supabase JS SDK.
-// This endpoint is provided for server-side / API clients.
 router.post('/login', async (req, res) => {
   const { email, password } = req.body
-
   if (!email || !password) {
     return res.status(400).json({ error: 'email and password are required.' })
   }
 
-  // Use anon-key client for signInWithPassword (service role key cannot sign in as user)
-  const { createClient } = require('@supabase/supabase-js')
-  const anonClient = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_ANON_KEY,
-    { auth: { autoRefreshToken: false, persistSession: false } }
-  )
+  try {
+    const { createClient } = require('@supabase/supabase-js')
+    const anonClient = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_ANON_KEY,
+      { auth: { autoRefreshToken: false, persistSession: false } }
+    )
 
-  const { data, error } = await anonClient.auth.signInWithPassword({ email, password })
+    const { data, error } = await anonClient.auth.signInWithPassword({
+      email: email.toLowerCase().trim(),
+      password,
+    })
 
-  if (error) {
-    return res.status(401).json({ error: error.message })
+    if (error) {
+      if (error.message?.toLowerCase().includes('invalid') ||
+          error.message?.toLowerCase().includes('credentials')) {
+        return res.status(401).json({ error: 'Invalid email or password' })
+      }
+      if (error.message?.toLowerCase().includes('confirm')) {
+        return res.status(401).json({ error: 'Please confirm your email before logging in.' })
+      }
+      return res.status(400).json({ error: error.message })
+    }
+
+    return res.json({
+      session: data.session,
+      user:    data.user,
+    })
+
+  } catch (err) {
+    console.error('[login] unexpected error:', err)
+    return res.status(500).json({ error: 'Login failed — please try again' })
   }
-
-  return res.json({
-    session: data.session,
-    user:    data.user,
-  })
 })
 
 module.exports = router

@@ -118,6 +118,67 @@ router.get('/dashboard', async (req, res) => {
 })
 
 // ── POST /api/partner/projects ────────────────────────────────────────────────
+// ── GET /api/partner/projects ─────────────────────────────────────────────────
+// Portfolio view — this partner's own APPROVED projects, with live stats from
+// the projects table (tree progress, tCO2e, evidence, funders). Distinct from
+// /submissions, which tracks the review pipeline (pending/approved/rejected).
+router.get('/projects', async (req, res) => {
+  try {
+    const userId = req.userId
+
+    const { data: subs, error: subErr } = await supabase
+      .from('project_submissions')
+      .select('id, title, project_id, submitted_at')
+      .eq('submitted_by', userId)
+      .eq('status', 'approved')
+      .not('project_id', 'is', null)
+
+    if (subErr) throw subErr
+
+    const projectIds = [...new Set((subs || []).map(s => s.project_id))]
+    if (projectIds.length === 0) return res.json({ projects: [] })
+
+    const { data: projects, error: projErr } = await supabase
+      .from('projects')
+      .select(`
+        id, name, element, category, location, description,
+        total_trees, funded_trees, tco2e, evidence_count, funders_count,
+        status, active, cover_image, last_evidence_date
+      `)
+      .in('id', projectIds)
+
+    if (projErr) throw projErr
+
+    const approvedAtMap = Object.fromEntries((subs || []).map(s => [s.project_id, s.submitted_at]))
+
+    const result = (projects || []).map(p => ({
+      id:              p.id,
+      name:            p.name,
+      element:         p.element,
+      category:        p.category,
+      location:        p.location,
+      description:     p.description,
+      totalTrees:      p.total_trees,
+      fundedTrees:     p.funded_trees,
+      progressPct:     p.total_trees > 0 ? Math.min(100, Math.round((p.funded_trees / p.total_trees) * 100)) : 0,
+      tco2e:           p.tco2e,
+      evidenceCount:   p.evidence_count,
+      fundersCount:    p.funders_count,
+      status:          p.status,
+      active:          p.active,
+      coverImage:      p.cover_image,
+      lastEvidenceDate: p.last_evidence_date,
+      approvedAt:      approvedAtMap[p.id] || null,
+    }))
+
+    res.json({ projects: result })
+  } catch (err) {
+    console.error('[partner/projects GET]', err)
+    res.status(500).json({ error: 'Failed to load projects' })
+  }
+})
+
+// ── POST /api/partner/projects ────────────────────────────────────────────────
 router.post('/projects', async (req, res) => {
   try {
     const userId = req.userId
@@ -224,6 +285,66 @@ router.get('/submissions', async (req, res) => {
   } catch (err) {
     console.error('[partner/submissions]', err)
     res.status(500).json({ error: 'Failed to load submissions' })
+  }
+})
+
+// ── GET /api/partner/submissions/:id ──────────────────────────────────────────
+// Full detail for a single submission — used by the "open project" detail modal.
+router.get('/submissions/:id', async (req, res) => {
+  try {
+    const userId = req.userId
+    const { id } = req.params
+
+    const { data: sub, error } = await supabase
+      .from('project_submissions')
+      .select('*')
+      .eq('id', id)
+      .eq('submitted_by', userId) // partners can only open their own submissions
+      .maybeSingle()
+
+    if (error) throw error
+    if (!sub) return res.status(404).json({ error: 'Submission not found' })
+
+    const { data: files } = await supabase
+      .from('evidence_files')
+      .select('id, file_name, file_type, file_size, uploaded_at, status')
+      .eq('submission_id', id)
+      .order('uploaded_at', { ascending: false })
+
+    res.json({
+      submission: {
+        id:              sub.id,
+        title:           sub.title,
+        element:         sub.element,
+        category:        sub.category,
+        projectType:     sub.project_type,
+        description:     sub.description,
+        location:        sub.location,
+        startDate:       sub.start_date,
+        endDate:         sub.end_date,
+        treeCount:       sub.tree_count,
+        status:          sub.status,
+        submittedAt:     sub.submitted_at,
+        reviewedAt:      sub.reviewed_at,
+        reviewNotes:     sub.review_notes,
+        partnerReviewStatus: sub.partner_review_status,
+        partnerReviewNotes:  sub.partner_review_notes,
+        moreInfoRequest: sub.more_info_request,
+      },
+      evidenceFiles: (files || []).map(f => ({
+        id:         f.id,
+        fileName:   f.file_name,
+        fileType:   f.file_type,
+        fileSize:   f.file_size < 1024 * 1024
+          ? `${(f.file_size / 1024).toFixed(1)} KB`
+          : `${(f.file_size / (1024 * 1024)).toFixed(1)} MB`,
+        uploadedAt: f.uploaded_at,
+        status:     f.status || 'pending',
+      })),
+    })
+  } catch (err) {
+    console.error('[partner/submissions/:id]', err)
+    res.status(500).json({ error: 'Failed to load submission' })
   }
 })
 

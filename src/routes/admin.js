@@ -518,11 +518,13 @@ router.patch('/users/:id', requireAdmin, async (req, res) => {
 
 // ─── A5: Projects oversight ───────────────────────────────────────────────────
 // GET /api/admin/projects
-router.get('/projects', requireAdmin, async (req, res) => {
+router.get('/projects', requireAdminOrPartner, async (req, res) => {
   try {
+    // NOTE: this previously selected columns (title, tree_count, profiles(display_name))
+    // that don't exist on `projects` — it 500'd on every call. Fixed to match the real schema.
     const { data, error } = await supabase
       .from('projects')
-      .select('id, title, element, location, status, tree_count, created_at, profiles(display_name)')
+      .select('id, name, element, category, location, partner, total_trees, funded_trees, status, active, created_at')
       .order('created_at', { ascending: false })
 
     if (error) throw error
@@ -530,16 +532,41 @@ router.get('/projects', requireAdmin, async (req, res) => {
     res.json({
       projects: (data || []).map(p => ({
         id:          p.id,
-        title:       p.title,
+        title:       p.name,
         element:     p.element,
+        category:    p.category,
         location:    p.location,
-        submittedBy: p.profiles?.display_name || '—',
-        partnerName: '—',
-        treeCount:   p.tree_count || 0,
-        status:      p.status || 'pending_review',
+        submittedBy: p.partner || '—',
+        partnerName: p.partner || '—',
+        treeCount:   p.total_trees || 0,
+        fundedTrees: p.funded_trees || 0,
+        status:      p.status || 'active',
+        active:      p.active,
         submittedAt: new Date(p.created_at).toLocaleDateString('en-GB'),
       }))
     })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /api/admin/tree-records — list tree records, optionally filtered by project
+// Used by the task-creation form ("link to tree") and the bulk task-generation flow.
+router.get('/tree-records', requireAdminOrPartner, async (req, res) => {
+  try {
+    const { project_id, limit } = req.query
+    let query = supabase
+      .from('tree_records')
+      .select('id, species, project_id, latitude, longitude, health_status, submitted_at')
+      .order('submitted_at', { ascending: false })
+      .limit(limit ? parseInt(limit, 10) : 200)
+
+    if (project_id) query = query.eq('project_id', project_id)
+
+    const { data, error } = await query
+    if (error) throw error
+
+    res.json({ records: data || [] })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -779,6 +806,504 @@ router.patch('/config/factors', requireAdmin, async (req, res) => {
 // PATCH /api/admin/config/settings
 router.patch('/config/settings', requireAdmin, async (req, res) => {
   res.json({ success: true })
+})
+
+// ─── Task Management (Admin) ──────────────────────────────────────────────────
+
+// GET /api/admin/tasks — list all tasks with filters
+router.get('/tasks', requireAdminOrPartner, async (req, res) => {
+  try {
+    const { status, project_id, assignee_id } = req.query
+    let query = supabase
+      .from('tasks')
+      .select(`
+        id, task_code, name, project_id, assignee_id, target_count,
+        location, priority, status, due_date, started_at, completed_at,
+        created_at, created_by, reviewed_by, review_notes, reviewed_at,
+        tree_id, captured
+      `)
+      .order('created_at', { ascending: false })
+      .limit(200)
+
+    if (status)      query = query.eq('status', status)
+    if (project_id)  query = query.eq('project_id', project_id)
+    if (assignee_id) query = query.eq('assignee_id', assignee_id)
+
+    const { data, error } = await query
+    if (error) throw error
+
+    // Enrich with assignee name + project name
+    const profileIds = [...new Set((data || []).map(t => t.assignee_id).filter(Boolean))]
+    let profileMap = {}
+    if (profileIds.length > 0) {
+      const { data: profiles } = await supabase
+        .from('profiles')
+        .select('auth_id, id, display_name')
+        .in('auth_id', profileIds)
+      ;(profiles || []).forEach(p => { profileMap[p.auth_id] = p.display_name })
+    }
+
+    const projectIds = [...new Set((data || []).map(t => t.project_id).filter(Boolean))]
+    let projectMap = {}
+    if (projectIds.length > 0) {
+      const { data: projects } = await supabase
+        .from('projects')
+        .select('id, name')
+        .in('id', projectIds)
+      ;(projects || []).forEach(p => { projectMap[p.id] = p.name })
+    }
+
+    res.json({
+      tasks: (data || []).map(t => ({
+        ...t,
+        assignee_name: profileMap[t.assignee_id] || t.assignee_id || '—',
+        project_name:  projectMap[t.project_id]  || t.project_id  || '—',
+      }))
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /api/admin/tasks — create a new task
+// Body: { name, project_id, assignee_id, tree_id?, target_count, location, priority, due_date }
+router.post('/tasks', requireAdminOrPartner, async (req, res) => {
+  try {
+    const { name, project_id, assignee_id, tree_id, target_count, location, priority, due_date } = req.body
+
+    if (!name || !assignee_id) {
+      return res.status(400).json({ error: 'name and assignee_id are required' })
+    }
+
+    // assignee_id must be a real profile's auth_id (uuid) with an Admin/Partner role —
+    // this is the whole assignable pool. Prevents the old profiles.id-vs-auth_id mismatch
+    // from silently corrupting/failing the insert.
+    const { data: assigneeProfile } = await supabase
+      .from('profiles')
+      .select('auth_id, role, roles')
+      .eq('auth_id', assignee_id)
+      .maybeSingle()
+
+    const assigneeRoles = assigneeProfile ? [assigneeProfile.role, ...(assigneeProfile.roles || [])] : []
+    if (!assigneeProfile || !assigneeRoles.some(r => ['admin', 'partner'].includes(r))) {
+      return res.status(400).json({ error: 'assignee_id must belong to an Admin or Partner account' })
+    }
+
+    // Generate task_code
+    let task_code = null
+    if (tree_id) {
+      const { data: codeRow } = await supabase
+        .rpc('generate_task_code', { p_tree_id: tree_id })
+      task_code = codeRow
+    } else {
+      // Fallback: TRK-XXXX-T{seq} using random short id
+      const shortId = Math.random().toString(36).substring(2, 6).toUpperCase()
+      const { count } = await supabase.from('tasks').select('id', { count: 'exact', head: true })
+      const seq = ((count || 0) + 1).toString().padStart(3, '0')
+      task_code = `TRK-${shortId}-T${seq}`
+    }
+
+    const { data, error } = await supabase
+      .from('tasks')
+      .insert({
+        name,
+        project_id:   project_id   || null,
+        assignee_id,
+        tree_id:      tree_id      || null,
+        task_code,
+        target_count: target_count || 10,
+        location:     location     || null,
+        priority:     priority     || 'medium',
+        due_date:     due_date     || null,
+        status:       'assigned',
+        captured:     0,
+        created_by:   req.reviewerId,
+      })
+      .select()
+      .single()
+
+    if (error) throw error
+
+    // Notify assignee
+    await createNotification({
+      userId: assignee_id,
+      type:   'task_assigned',
+      title:  `New task assigned: ${name}`,
+      body:   `Task ${task_code} has been assigned to you. Priority: ${priority || 'medium'}.`,
+      link:   '/app/tasks',
+    })
+
+    res.status(201).json({ task: data })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// PUT /api/admin/tasks/:id — update task (reassign, change priority, etc.)
+// Unlike POST /tasks, assignee_id here is NOT restricted to Admin/Partner — this is also
+// how a ticket gets handed off to the real TreeApp field/individual user who'll do the work.
+router.put('/tasks/:id', requireAdminOrPartner, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { name, project_id, assignee_id, target_count, location, priority, due_date, status } = req.body
+
+    let newAssigneeProfile = null
+    if (assignee_id !== undefined) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('auth_id, display_name')
+        .eq('auth_id', assignee_id)
+        .maybeSingle()
+      if (!profile) return res.status(400).json({ error: 'assignee_id does not match any known account' })
+      newAssigneeProfile = profile
+    }
+
+    const updates = {}
+    if (name         !== undefined) updates.name         = name
+    if (project_id   !== undefined) updates.project_id   = project_id
+    if (assignee_id  !== undefined) updates.assignee_id  = assignee_id
+    if (target_count !== undefined) updates.target_count = target_count
+    if (location     !== undefined) updates.location     = location
+    if (priority     !== undefined) updates.priority     = priority
+    if (due_date     !== undefined) updates.due_date     = due_date
+    if (status       !== undefined) updates.status       = status
+
+    const { data: before } = await supabase.from('tasks').select('assignee_id, name, task_code').eq('id', id).maybeSingle()
+
+    const { data, error } = await supabase
+      .from('tasks')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single()
+
+    if (error) throw error
+
+    // Notify the new assignee when the ticket is actually handed off to someone new
+    if (newAssigneeProfile && before && before.assignee_id !== assignee_id) {
+      await createNotification({
+        userId: assignee_id,
+        type:   'task_assigned',
+        title:  `Task assigned to you: ${data.name}`,
+        body:   `${data.task_code || id.slice(0, 8).toUpperCase()} has been assigned to you.`,
+        link:   '/app/tasks',
+      })
+    }
+
+    res.json({ task: data })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// DELETE /api/admin/tasks/:id
+router.delete('/tasks/:id', requireAdminOrPartner, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { error } = await supabase.from('tasks').delete().eq('id', id)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /api/admin/tasks/assignable-users — the curated assignee pool for task creation.
+// Only accounts with a real auth login — NOT the full user list, and NOT profiles with
+// no auth_id (they could never be validly assigned anything).
+// ?pool=admin_partner (default) — Admin/Partner accounts. Used for creating/generating
+//   tickets — who *owns* the ticket.
+// ?pool=field — individual / field_user accounts who have actually captured at least one
+//   tree via TreeApp (real field activity — not just signed up or logged in). Used for
+//   handing an already-created ticket off to whoever will actually go do the fieldwork.
+router.get('/tasks/assignable-users', requireAdminOrPartner, async (req, res) => {
+  try {
+    const pool = req.query.pool === 'field' ? 'field' : 'admin_partner'
+    const matchRoles = pool === 'field' ? ['individual', 'field_user'] : ['admin', 'partner']
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('auth_id, display_name, role, roles')
+      .not('auth_id', 'is', null)
+
+    if (error) throw error
+
+    let assignable = (data || []).filter(p => {
+      const roles = [p.role, ...(p.roles || [])]
+      return roles.some(r => matchRoles.includes(r))
+    })
+
+    // For the field pool, only users who have actually done real field work — i.e. have
+    // at least one tree_records row of their own. Excludes accounts that merely signed up
+    // or logged in but never captured anything.
+    if (pool === 'field') {
+      const { data: activeIds } = await supabase.from('tree_records').select('user_id')
+      const capturedIds = new Set((activeIds || []).map(t => t.user_id))
+      assignable = assignable.filter(p => capturedIds.has(p.auth_id))
+    }
+
+    res.json({
+      users: assignable.map(p => ({
+        auth_id:      p.auth_id,
+        display_name: p.display_name || p.auth_id,
+        role:         p.role,
+      }))
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /api/admin/tasks/bulk-generate — create one task per tree in a project.
+// Body: { project_id, assignee_id, priority? }
+// Skips trees that already have a task (safe to call repeatedly / incrementally).
+router.post('/tasks/bulk-generate', requireAdminOrPartner, async (req, res) => {
+  try {
+    const { project_id, assignee_id, priority } = req.body
+    if (!project_id || !assignee_id) {
+      return res.status(400).json({ error: 'project_id and assignee_id are required' })
+    }
+
+    const { data: assigneeProfile } = await supabase
+      .from('profiles')
+      .select('auth_id, role, roles')
+      .eq('auth_id', assignee_id)
+      .maybeSingle()
+    const assigneeRoles = assigneeProfile ? [assigneeProfile.role, ...(assigneeProfile.roles || [])] : []
+    if (!assigneeProfile || !assigneeRoles.some(r => ['admin', 'partner'].includes(r))) {
+      return res.status(400).json({ error: 'assignee_id must belong to an Admin or Partner account' })
+    }
+
+    const { data: trees, error: treeErr } = await supabase
+      .from('tree_records')
+      .select('id, species, latitude, longitude')
+      .eq('project_id', project_id)
+    if (treeErr) throw treeErr
+
+    const { data: existingTasks } = await supabase
+      .from('tasks')
+      .select('tree_id')
+      .eq('project_id', project_id)
+    const alreadyTicketed = new Set((existingTasks || []).map(t => t.tree_id))
+
+    const toCreate = (trees || []).filter(t => !alreadyTicketed.has(t.id))
+
+    let created = 0
+    const errors = []
+    for (const tree of toCreate) {
+      const { data: codeData } = await supabase.rpc('generate_task_code', { p_tree_id: tree.id })
+      const { error: insErr } = await supabase.from('tasks').insert({
+        name:         `Tree Survey — ${tree.species || 'Unknown species'} (${tree.id.slice(0, 8).toUpperCase()})`,
+        project_id,
+        assignee_id,
+        tree_id:      tree.id,
+        task_code:    codeData || null,
+        target_count: 1,
+        location:     (tree.latitude != null && tree.longitude != null) ? `${tree.latitude}, ${tree.longitude}` : null,
+        priority:     priority || 'medium',
+        status:       'assigned',
+        captured:     0,
+        created_by:   req.reviewerId,
+      })
+      if (insErr) { errors.push({ tree_id: tree.id, error: insErr.message }); continue }
+      created++
+    }
+
+    if (created > 0) {
+      await createNotification({
+        userId: assignee_id,
+        type:   'task_assigned',
+        title:  `${created} new tree task${created !== 1 ? 's' : ''} assigned`,
+        body:   `You've been assigned ${created} tree survey task${created !== 1 ? 's' : ''} for project ${project_id}.`,
+        link:   '/app/tasks',
+      })
+    }
+
+    res.status(201).json({
+      created,
+      skipped: (trees || []).length - toCreate.length,
+      totalTrees: (trees || []).length,
+      errors,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─── Task Review (Admin + Partner) ────────────────────────────────────────────
+
+// Auth guard — admin OR partner
+async function requireAdminOrPartner(req, res, next) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '')
+  if (!token) return res.status(401).json({ error: 'Unauthorized' })
+
+  const { data: { user }, error } = await supabase.auth.getUser(token)
+  if (error || !user) return res.status(401).json({ error: 'Unauthorized' })
+
+  let profile = null
+  const { data: byAuthId } = await supabase
+    .from('profiles')
+    .select('role, id')
+    .eq('auth_id', user.id)
+    .maybeSingle()
+
+  if (byAuthId) {
+    profile = byAuthId
+  } else {
+    const { data: byId } = await supabase
+      .from('profiles')
+      .select('role, id')
+      .eq('id', user.id)
+      .maybeSingle()
+    profile = byId
+  }
+
+  if (!profile || !['admin', 'partner'].includes(profile.role)) {
+    return res.status(403).json({ error: 'Forbidden — admin or partner only' })
+  }
+
+  req.reviewerId = user.id
+  req.reviewerRole = profile.role
+  next()
+}
+
+// GET /api/admin/tasks/pending-review — tasks completed by field users, awaiting review
+router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
+  try {
+    const { project_id } = req.query
+    let query = supabase
+      .from('tasks')
+      .select(`
+        id, task_code, name, project_id, assignee_id, target_count,
+        location, priority, status, due_date, started_at, completed_at,
+        created_at, tree_id, captured, review_notes
+      `)
+      .eq('status', 'completed')
+      .order('completed_at', { ascending: true })
+      .limit(100)
+
+    if (project_id) query = query.eq('project_id', project_id)
+
+    const { data, error } = await query
+    if (error) throw error
+
+    // Enrich with assignee name
+    const profileIds = [...new Set((data || []).map(t => t.assignee_id).filter(Boolean))]
+    let profileMap = {}
+    if (profileIds.length > 0) {
+      const { data: profiles } = await supabase
+        .from('profiles')
+        .select('auth_id, display_name')
+        .in('auth_id', profileIds)
+      ;(profiles || []).forEach(p => { profileMap[p.auth_id] = p.display_name })
+    }
+
+    const projectIds = [...new Set((data || []).map(t => t.project_id).filter(Boolean))]
+    let projectMap = {}
+    if (projectIds.length > 0) {
+      const { data: projects } = await supabase
+        .from('projects')
+        .select('id, name')
+        .in('id', projectIds)
+      ;(projects || []).forEach(p => { projectMap[p.id] = p.name })
+    }
+
+    res.json({
+      tasks: (data || []).map(t => ({
+        ...t,
+        assignee_name: profileMap[t.assignee_id] || '—',
+        project_name:  projectMap[t.project_id]  || '—',
+      }))
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// PUT /api/admin/tasks/:id/approve
+router.put('/tasks/:id/approve', requireAdminOrPartner, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { review_notes } = req.body
+
+    const { data: task } = await supabase
+      .from('tasks')
+      .select('assignee_id, name, task_code')
+      .eq('id', id)
+      .single()
+
+    if (!task) return res.status(404).json({ error: 'Task not found' })
+
+    const { error } = await supabase
+      .from('tasks')
+      .update({
+        status:       'approved',
+        reviewed_by:  req.reviewerId,
+        review_notes: review_notes || null,
+        reviewed_at:  new Date().toISOString(),
+      })
+      .eq('id', id)
+
+    if (error) throw error
+
+    // Notify field user
+    if (task.assignee_id) {
+      await createNotification({
+        userId: task.assignee_id,
+        type:   'task_approved',
+        title:  `Task approved ✅`,
+        body:   `Your task "${task.name}" (${task.task_code || id.slice(0,8)}) has been approved.`,
+        link:   '/app/tasks',
+      })
+    }
+
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// PUT /api/admin/tasks/:id/reject
+router.put('/tasks/:id/reject', requireAdminOrPartner, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { review_notes } = req.body
+
+    const { data: task } = await supabase
+      .from('tasks')
+      .select('assignee_id, name, task_code')
+      .eq('id', id)
+      .single()
+
+    if (!task) return res.status(404).json({ error: 'Task not found' })
+
+    const { error } = await supabase
+      .from('tasks')
+      .update({
+        status:       'rejected',
+        reviewed_by:  req.reviewerId,
+        review_notes: review_notes || null,
+        reviewed_at:  new Date().toISOString(),
+      })
+      .eq('id', id)
+
+    if (error) throw error
+
+    // Notify field user
+    if (task.assignee_id) {
+      await createNotification({
+        userId: task.assignee_id,
+        type:   'task_rejected',
+        title:  `Task rejected ❌`,
+        body:   `Your task "${task.name}" (${task.task_code || id.slice(0,8)}) was rejected. ${review_notes || 'Please review and redo.'}`,
+        link:   '/app/tasks',
+      })
+    }
+
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
 })
 
 module.exports = router
