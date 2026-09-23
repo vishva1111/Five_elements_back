@@ -64,6 +64,75 @@ router.post('/apply', async (req, res) => {
 })
 
 // ── GET /api/partner/dashboard ────────────────────────────────────────────────
+// ── GET /api/partner/profile — this partner's own org profile (for Settings) ──
+router.get('/profile', async (req, res) => {
+  try {
+    const userId = req.userId
+    const { data, error } = await supabase
+      .from('partner_profiles')
+      .select('id, org_name, org_type, website, contact_name, contact_email, contact_phone, address, description, status')
+      .eq('user_id', userId)
+      .maybeSingle()
+
+    if (error) throw error
+    if (!data) return res.status(404).json({ error: 'No partner profile found for this account' })
+
+    res.json({
+      profile: {
+        orgName:      data.org_name,
+        orgType:      data.org_type,
+        website:      data.website,
+        contactName:  data.contact_name,
+        contactEmail: data.contact_email,
+        contactPhone: data.contact_phone,
+        address:      data.address,
+        description:  data.description,
+        status:       data.status,
+      }
+    })
+  } catch (err) {
+    console.error('[partner/profile GET]', err)
+    res.status(500).json({ error: 'Failed to load profile' })
+  }
+})
+
+// ── PATCH /api/partner/profile — update self-editable org fields ──────────────
+router.patch('/profile', async (req, res) => {
+  try {
+    const userId = req.userId
+    const { orgName, orgType, website, contactName, contactEmail, contactPhone, address, description } = req.body
+
+    const updates = {}
+    if (orgName      !== undefined) updates.org_name      = orgName
+    if (orgType      !== undefined) updates.org_type      = orgType
+    if (website       !== undefined) updates.website       = website
+    if (contactName  !== undefined) updates.contact_name  = contactName
+    if (contactEmail !== undefined) updates.contact_email = contactEmail
+    if (contactPhone !== undefined) updates.contact_phone = contactPhone
+    if (address       !== undefined) updates.address       = address
+    if (description   !== undefined) updates.description   = description
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' })
+    }
+
+    const { data, error } = await supabase
+      .from('partner_profiles')
+      .update(updates)
+      .eq('user_id', userId)
+      .select('id')
+      .maybeSingle()
+
+    if (error) throw error
+    if (!data) return res.status(404).json({ error: 'No partner profile found for this account' })
+
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[partner/profile PATCH]', err)
+    res.status(500).json({ error: 'Failed to save profile' })
+  }
+})
+
 router.get('/dashboard', async (req, res) => {
   try {
     const userId = req.userId

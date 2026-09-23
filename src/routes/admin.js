@@ -853,11 +853,25 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
       ;(projects || []).forEach(p => { projectMap[p.id] = p.name })
     }
 
+    // The photo the field user captured lives on the linked tree record, not the task.
+    const treeIds = [...new Set((data || []).map(t => t.tree_id).filter(Boolean))]
+    let treeMap = {}
+    if (treeIds.length > 0) {
+      const { data: trees } = await supabase
+        .from('tree_records')
+        .select('id, photo_url, species, health_status, submitted_at')
+        .in('id', treeIds)
+      ;(trees || []).forEach(tr => { treeMap[tr.id] = tr })
+    }
+
     res.json({
       tasks: (data || []).map(t => ({
         ...t,
         assignee_name: profileMap[t.assignee_id] || t.assignee_id || '—',
         project_name:  projectMap[t.project_id]  || t.project_id  || '—',
+        photo_url:     treeMap[t.tree_id]?.photo_url     || null,
+        tree_species:  treeMap[t.tree_id]?.species       || null,
+        tree_health:   treeMap[t.tree_id]?.health_status || null,
       }))
     })
   } catch (err) {
@@ -1099,7 +1113,10 @@ router.post('/tasks/bulk-generate', requireAdminOrPartner, async (req, res) => {
         tree_id:      tree.id,
         task_code:    codeData || null,
         target_count: 1,
-        location:     (tree.latitude != null && tree.longitude != null) ? `${tree.latitude}, ${tree.longitude}` : null,
+        // No location here — that used to pre-fill from the tree's original (months-old)
+        // coordinates. Location should reflect where the field user actually is when
+        // they complete this ticket, so it stays null until the app sets it on completion.
+        location:     null,
         priority:     priority || 'medium',
         status:       'assigned',
         captured:     0,
@@ -1208,11 +1225,25 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
       ;(projects || []).forEach(p => { projectMap[p.id] = p.name })
     }
 
+    // The photo the field user captured lives on the linked tree record, not the task.
+    const treeIds = [...new Set((data || []).map(t => t.tree_id).filter(Boolean))]
+    let treeMap = {}
+    if (treeIds.length > 0) {
+      const { data: trees } = await supabase
+        .from('tree_records')
+        .select('id, photo_url, species, health_status')
+        .in('id', treeIds)
+      ;(trees || []).forEach(tr => { treeMap[tr.id] = tr })
+    }
+
     res.json({
       tasks: (data || []).map(t => ({
         ...t,
         assignee_name: profileMap[t.assignee_id] || '—',
         project_name:  projectMap[t.project_id]  || '—',
+        photo_url:     treeMap[t.tree_id]?.photo_url     || null,
+        tree_species:  treeMap[t.tree_id]?.species       || null,
+        tree_health:   treeMap[t.tree_id]?.health_status || null,
       }))
     })
   } catch (err) {
