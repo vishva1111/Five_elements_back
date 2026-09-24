@@ -1,6 +1,7 @@
 const express = require('express')
 const router = express.Router()
 const supabase = require('../supabaseClient')
+const { recordFunding } = require('../services/funding')
 
 /**
  * POST /api/fund
@@ -75,77 +76,23 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Project is not accepting funding' })
     }
 
-    // ── Calculate values ──────────────────────────────────────────────────────
-    const tCO2ePerTree = project.tco2e && project.total_trees > 0
-      ? Number(project.tco2e) / project.total_trees
-      : 0.017 // default estimate
-    const tCO2e = (trees * tCO2ePerTree).toFixed(4)
-    const orderId = `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`
-    const today = new Date().toISOString().split('T')[0]
-
-    // ── Insert ledger entry ───────────────────────────────────────────────────
-    const { data: entry, error: insertErr } = await supabase
-      .from('ledger_entries')
-      .insert({
-        id: orderId,
-        date: today,
-        project_id: project.id,
-        project: project.name,
-        funder: publicAttribution ? funderName : 'Anonymous',
-        trees: trees,
-        t_co2e: tCO2e,
-        verified: false,
-        tx_hash: null,
-      })
-      .select()
-      .single()
-
-    if (insertErr) {
-      console.error('[POST /api/fund] ledger insert error:', insertErr.message)
-      return res.status(500).json({ error: 'Failed to record funding', detail: insertErr.message })
-    }
-
-    // ── Update project counters (atomic SQL increment — avoids race conditions) ─
-    // Uses raw Postgres increment so concurrent requests don't overwrite each other.
-    const { error: updateErr } = await supabase.rpc('increment_project_funding', {
-      p_project_id:  project.id,
-      p_trees_delta: trees,
-    })
-
-    if (updateErr) {
-      // Fallback: if the RPC doesn't exist yet, use a non-atomic update (log warning)
-      console.warn('[POST /api/fund] RPC increment_project_funding not found, falling back to non-atomic update:', updateErr.message)
-      await supabase
-        .from('projects')
-        .update({
-          funded_trees:  (project.funded_trees || 0) + trees,
-          funders_count: (project.funders_count || 0) + 1,
-          updated_at:    new Date().toISOString(),
-        })
-        .eq('id', project.id)
-    }
-
-    // ── Insert individual_fundings row (if userId provided) ───────────────────
-    if (userId) {
-      const amountPaid = trees * (project.price_per_tree || 100) * 1.1 // includes 10% platform fee
-      const { error: fundingErr } = await supabase
-        .from('individual_fundings')
-        .insert({
-          user_id: userId,
-          project_id: project.id,
-          trees_funded: trees,
-          amount_paid: Math.round(amountPaid),
-          funded_at: new Date().toISOString(),
-          verification_status: 'pending',
-          has_ledger_entry: true,
-          ledger_entry_id: null, // ledger entry id is a text field, not uuid — skip FK
-          public_attribution: publicAttribution,
-          funder_name: publicAttribution ? funderName : 'Anonymous',
-        })
-      if (fundingErr) {
-        console.error('[POST /api/fund] individual_fundings insert error:', fundingErr.message)
-        // Non-fatal for demo
-      }
+    // ── Record the funding (ledger entry, project counters, individual_fundings) ─
+    // amountPaid is intentionally omitted here — recordFunding then applies its
+    // built-in trees * price_per_tree * 1.1 default, exactly as this route
+    // always has.
+    let orderId, tCO2e
+    try {
+      ;({ orderId, tCO2e } = await recordFunding({
+        project,
+        trees,
+        funderName,
+        publicAttribution,
+        userId,
+        verificationStatus: 'pending',
+      }))
+    } catch (e) {
+      console.error('[POST /api/fund]', e.message)
+      return res.status(500).json({ error: 'Failed to record funding', detail: e.message })
     }
 
     // ── Respond ───────────────────────────────────────────────────────────────

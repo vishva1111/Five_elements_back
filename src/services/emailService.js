@@ -207,4 +207,76 @@ async function sendRoleAddedEmail({ toEmail, displayName, newRole }) {
   }
 }
 
-module.exports = { sendWelcomeEmail, sendRoleAddedEmail }
+/**
+ * Sent when staff create an account on someone's behalf — a Super Admin adding
+ * a partner, or a partner inviting a team member. Carries the temporary password
+ * because the recipient never chose one.
+ */
+async function sendAccountCreatedEmail({ toEmail, displayName, roleLabel, tempPassword, orgName }) {
+  const appUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
+
+  const htmlContent = `
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+          <tr>
+            <td style="background:linear-gradient(135deg,#1a6b3c 0%,#2d9e5f 100%);padding:40px;text-align:center;">
+              <h1 style="color:#ffffff;margin:0;font-size:28px;">🌿 Five Elements</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:40px;">
+              <h2 style="color:#1a6b3c;margin:0 0 16px;">Your ${roleLabel} account is ready</h2>
+              <p style="color:#444;font-size:16px;line-height:1.6;margin:0 0 20px;">
+                Hi ${displayName}, an account has been created for you${orgName ? ` under <strong>${orgName}</strong>` : ''} on Five Elements.
+              </p>
+              <table cellpadding="0" cellspacing="0" width="100%" style="background:#f4f7f6;border-radius:8px;margin:0 0 24px;">
+                <tr><td style="padding:18px 20px;">
+                  <p style="color:#666;font-size:13px;margin:0 0 6px;">Email</p>
+                  <p style="color:#111;font-size:15px;font-weight:600;margin:0 0 14px;">${toEmail}</p>
+                  <p style="color:#666;font-size:13px;margin:0 0 6px;">Temporary password</p>
+                  <p style="color:#111;font-size:18px;font-weight:700;letter-spacing:1px;margin:0;font-family:monospace;">${tempPassword}</p>
+                </td></tr>
+              </table>
+              <p style="color:#8B3A00;font-size:14px;line-height:1.6;margin:0 0 28px;">
+                Please change this password after your first sign-in.
+              </p>
+              <table cellpadding="0" cellspacing="0" style="margin:0 auto;">
+                <tr>
+                  <td style="background:#1a6b3c;border-radius:8px;padding:14px 32px;">
+                    <a href="${appUrl}/login" style="color:#ffffff;text-decoration:none;font-size:16px;font-weight:600;">Sign In →</a>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="background:#f4f7f6;padding:20px 40px;text-align:center;">
+              <p style="color:#aaa;font-size:12px;margin:0;">© 2025 Five Elements. All rights reserved.</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`.trim()
+
+  try {
+    await sendBrevoEmail({
+      toEmail,
+      toName:  displayName,
+      subject: `Your Five Elements ${roleLabel} account`,
+      htmlContent,
+    })
+  } catch (err) {
+    console.error('[emailService] sendAccountCreatedEmail failed:', err.message)
+  }
+}
+
+module.exports = { sendWelcomeEmail, sendRoleAddedEmail, sendAccountCreatedEmail }

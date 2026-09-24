@@ -3,41 +3,20 @@ const router   = express.Router()
 const supabase = require('../supabaseClient')
 const crypto   = require('crypto')
 const { createNotification } = require('./notifications')
-
-// ─── Auth guard — admin only ──────────────────────────────────────────────────
-async function requireAdmin(req, res, next) {
-  const token = (req.headers.authorization || '').replace('Bearer ', '')
-  if (!token) return res.status(401).json({ error: 'Unauthorized' })
-
-  const { data: { user }, error } = await supabase.auth.getUser(token)
-  if (error || !user) return res.status(401).json({ error: 'Unauthorized' })
-
-  // Check role in profiles table — try auth_id first, fall back to id (for test users with UUID as id)
-  let profile = null
-  const { data: byAuthId } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('auth_id', user.id)
-    .maybeSingle()
-
-  if (byAuthId) {
-    profile = byAuthId
-  } else {
-    const { data: byId } = await supabase
-      .from('profiles')
-      .select('role')
-      .eq('id', user.id)
-      .maybeSingle()
-    profile = byId
-  }
-
-  if (!profile || profile.role !== 'admin') {
-    return res.status(403).json({ error: 'Forbidden — admin only' })
-  }
-
-  req.adminId = user.id
-  next()
-}
+const { sendAccountCreatedEmail } = require('../services/emailService')
+const { withSignedUrls } = require('../services/evidenceUrls')
+const { listAllAuthUsers } = require('../services/authUsers')
+const {
+  grantRole,
+  ensureFounderIsAdminMember,
+  slugify,
+  uniqueProjectSlug,
+  DEFAULT_TCO2E_PER_TREE,
+  publishCaptureToLedger,
+  generateTempPassword,
+  requireAdmin,
+  requireAdminOrPartner,
+} = require('../services/adminHelpers')
 
 // ─── A1: Approval queue ───────────────────────────────────────────────────────
 // GET /api/admin/queue
@@ -93,9 +72,9 @@ router.get('/queue', requireAdmin, async (req, res) => {
     // Pending partner applications
     const { data: partners } = await supabase
       .from('partner_profiles')
-      .select('id, org_name, user_id, created_at')
+      .select('id, org_name, user_id, applied_at, contact_name, contact_email')
       .eq('status', 'pending')
-      .order('created_at', { ascending: true })
+      .order('applied_at', { ascending: true })
       .limit(50)
 
     if (partners) {
@@ -104,8 +83,8 @@ router.get('/queue', requireAdmin, async (req, res) => {
           id:          p.id,
           type:        'partner',
           title:       p.org_name || 'Partner application',
-          submittedBy: p.user_id || '—',
-          submittedAt: new Date(p.created_at).toLocaleDateString('en-GB'),
+          submittedBy: p.contact_name || p.contact_email || p.user_id || '—',
+          submittedAt: p.applied_at ? new Date(p.applied_at).toLocaleDateString('en-GB') : '—',
           element:     '',
           priority:    'normal',
         })
@@ -124,14 +103,16 @@ router.get('/evidence/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params
 
+    // Real columns only: evidence_files has no file_url / notes / created_at,
+    // and the project detail lives on project_submissions itself, not on a
+    // projects join (projects has `name`/`total_trees`, not `title`/`tree_count`).
     const { data: ev, error } = await supabase
       .from('evidence_files')
       .select(`
-        id, file_name, file_type, file_size, file_url, notes, status, created_at,
-        submission_id,
+        id, file_name, file_type, file_size, storage_path, status, review_notes,
+        uploaded_at, submission_id,
         project_submissions(
-          id, submitted_by, status,
-          projects(id, title, element, location, description, tree_count)
+          id, submitted_by, status, title, element, location, description, tree_count
         )
       `)
       .eq('id', id)
@@ -139,27 +120,27 @@ router.get('/evidence/:id', requireAdmin, async (req, res) => {
 
     if (error || !ev) return res.status(404).json({ error: 'Not found' })
 
-    const sub  = ev.project_submissions
-    const proj = sub?.projects
+    const sub = ev.project_submissions
+    const [signed] = await withSignedUrls([ev])
 
     res.json({
       id:            ev.id,
       submissionId:  ev.submission_id,
-      projectTitle:  proj?.title || '—',
-      element:       proj?.element || '—',
+      projectTitle:  sub?.title || '—',
+      element:       sub?.element || '—',
       submittedBy:   sub?.submitted_by || '—',
-      submittedAt:   new Date(ev.created_at).toLocaleDateString('en-GB'),
-      location:      proj?.location || '—',
-      treeCount:     proj?.tree_count || 0,
-      description:   proj?.description || '',
-      evidenceNotes: ev.notes || '',
+      submittedAt:   ev.uploaded_at ? new Date(ev.uploaded_at).toLocaleDateString('en-GB') : '—',
+      location:      sub?.location || '—',
+      treeCount:     sub?.tree_count || 0,
+      description:   sub?.description || '',
+      evidenceNotes: ev.review_notes || '',
       status:        ev.status || 'pending_review',
       files: [{
         id:   ev.id,
         name: ev.file_name || 'file',
         type: ev.file_type || 'application/octet-stream',
         size: ev.file_size ? `${Math.round(ev.file_size / 1024)} KB` : '—',
-        url:  ev.file_url || null,
+        url:  signed?.file_url || null,
       }],
     })
   } catch (err) {
@@ -269,8 +250,8 @@ router.get('/partners', requireAdmin, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('partner_profiles')
-      .select('id, org_name, org_type, contact_name, contact_email, website, years_active, status, created_at, description')
-      .order('created_at', { ascending: false })
+      .select('id, org_name, org_type, contact_name, contact_email, website, years_active, status, applied_at, description')
+      .order('applied_at', { ascending: false })
 
     if (error) throw error
 
@@ -284,7 +265,7 @@ router.get('/partners', requireAdmin, async (req, res) => {
         website:      p.website,
         yearsActive:  p.years_active,
         status:       p.status,
-        appliedAt:    new Date(p.created_at).toLocaleDateString('en-GB'),
+        appliedAt:    p.applied_at ? new Date(p.applied_at).toLocaleDateString('en-GB') : '—',
         description:  p.description,
       }))
     })
@@ -302,7 +283,7 @@ router.patch('/partners/:id', requireAdmin, async (req, res) => {
     // Fetch partner to get user_id for notification
     const { data: partner } = await supabase
       .from('partner_profiles')
-      .select('user_id, org_name')
+      .select('user_id, org_name, contact_name, contact_email')
       .eq('id', id)
       .single()
 
@@ -312,6 +293,26 @@ router.patch('/partners/:id', requireAdmin, async (req, res) => {
       .eq('id', id)
 
     if (error) throw error
+
+    // Approval is what makes someone a partner. Without this the account keeps
+    // role 'individual', so ProtectedRoute and requirePartner both reject it and
+    // the "you can now access the partner portal" notification goes nowhere.
+    let roleWarning = null
+    if (status === 'approved' && partner?.user_id) {
+      const granted = await grantRole(partner.user_id, 'partner')
+      if (!granted.ok) {
+        roleWarning = `Approved, but the partner role could not be granted: ${granted.error}`
+        console.error('[admin/partners approve] grantRole failed:', granted.error)
+      }
+
+      // The primary contact becomes the first partner_admin (P1-04).
+      await ensureFounderIsAdminMember({
+        partnerId:  id,
+        authUserId: partner.user_id,
+        name:       partner.contact_name,
+        email:      partner.contact_email,
+      })
+    }
 
     // 6.3: Notify partner user of decision
     if (partner?.user_id) {
@@ -334,8 +335,144 @@ router.patch('/partners/:id', requireAdmin, async (req, res) => {
       }
     }
 
-    res.json({ success: true })
+    res.json({ success: true, warning: roleWarning })
   } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /api/admin/partners — Super Admin creates a partner outright.
+// The application flow (partner applies -> admin approves) still works; this is
+// the top-down path: the admin makes the org and its login in one step.
+router.post('/partners', requireAdmin, async (req, res) => {
+  try {
+    const {
+      orgName, orgType, contactName, contactEmail, contactPhone,
+      website, address, description,
+    } = req.body
+
+    if (!orgName || !contactName || !contactEmail) {
+      return res.status(400).json({ error: 'orgName, contactName and contactEmail are required' })
+    }
+
+    const email = String(contactEmail).toLowerCase().trim()
+
+    // Reuse the account if this person already exists, rather than failing.
+    const listed = await listAllAuthUsers()
+    let authUser = (listed?.users || []).find(u => u.email?.toLowerCase() === email)
+    let tempPassword = null
+
+    if (!authUser) {
+      tempPassword = generateTempPassword()
+      const { data: created, error: createErr } = await supabase.auth.admin.createUser({
+        email,
+        password: tempPassword,
+        email_confirm: true,
+        user_metadata: { display_name: contactName },
+      })
+      if (createErr) return res.status(400).json({ error: createErr.message })
+      authUser = created.user
+    }
+
+    // One partner profile per account.
+    const { data: existingProfile } = await supabase
+      .from('partner_profiles')
+      .select('id')
+      .eq('user_id', authUser.id)
+      .maybeSingle()
+
+    if (existingProfile) {
+      return res.status(409).json({ error: 'This account already has a partner profile' })
+    }
+
+    // Platform profile — created if the account is brand new, then given the role.
+    const { data: profileRow } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('auth_id', authUser.id)
+      .maybeSingle()
+
+    if (!profileRow) {
+      const { error: profErr } = await supabase.from('profiles').insert({
+        id:           `partner-${authUser.id.slice(0, 8)}`,
+        auth_id:      authUser.id,
+        display_name: contactName,
+        name:         orgName,
+        type:         'Individual',   // profiles_type_check allows Individual | Business
+
+        location:     address || '',
+        avatar:       '',
+        trees:        0,
+        t_co2e:       0,
+        role:         'partner',
+        roles:        ['partner'],
+        status:       'active',
+        is_first_login: true,
+      })
+      if (profErr) return res.status(500).json({ error: `Profile creation failed: ${profErr.message}` })
+    } else {
+      const granted = await grantRole(authUser.id, 'partner')
+      if (!granted.ok) return res.status(500).json({ error: `Role grant failed: ${granted.error}` })
+    }
+
+    const nowIso = new Date().toISOString()
+    const { data: partner, error: partnerErr } = await supabase
+      .from('partner_profiles')
+      .insert({
+        user_id:       authUser.id,
+        org_name:      orgName,
+        org_type:      orgType || null,
+        website:       website || null,
+        contact_name:  contactName,
+        contact_email: email,
+        contact_phone: contactPhone || null,
+        address:       address || null,
+        description:   description || null,
+        status:        'approved',       // admin-created partners skip review
+        applied_at:    nowIso,
+        reviewed_by:   req.adminId,
+        reviewed_at:   nowIso,
+      })
+      .select('id')
+      .single()
+
+    if (partnerErr) return res.status(500).json({ error: partnerErr.message })
+
+    // The contact becomes the org's first partner_admin (P1-04).
+    await ensureFounderIsAdminMember({
+      partnerId:  partner.id,
+      authUserId: authUser.id,
+      name:       contactName,
+      email,
+    })
+
+    if (tempPassword) {
+      await sendAccountCreatedEmail({
+        toEmail:      email,
+        displayName:  contactName,
+        roleLabel:    'Implementation Partner',
+        tempPassword,
+        orgName,
+      }).catch(e => console.error('[admin/partners] invite email failed:', e.message))
+    }
+
+    await createNotification({
+      userId: authUser.id,
+      type:   'partner_approved',
+      title:  'Your partner account is ready ✅',
+      body:   `${orgName} has been set up by the Five Elements team. You can register projects now.`,
+      link:   '/partner/dashboard',
+    })
+
+    res.status(201).json({
+      id: partner.id,
+      userId: authUser.id,
+      // Returned once so the admin can pass it on if the email bounces.
+      tempPassword,
+      reusedExistingAccount: !tempPassword,
+    })
+  } catch (err) {
+    console.error('[admin/partners POST]', err)
     res.status(500).json({ error: err.message })
   }
 })
@@ -356,7 +493,7 @@ router.get('/submissions', requireAdmin, async (req, res) => {
         partner_review_status, partner_review_notes, partner_reviewed_at,
         status, submitted_by, submitted_at, reviewed_by, reviewed_at, review_notes,
         outcome, more_info_request, more_info_response,
-        evidence_files(id, file_name, file_type, file_size, file_url, storage_path)
+        evidence_files(id, file_name, file_type, file_size, storage_path)
       `)
       .eq('status', status)
       .order('submitted_at', { ascending: true })
@@ -364,7 +501,12 @@ router.get('/submissions', requireAdmin, async (req, res) => {
 
     if (error) throw error
 
-    res.json({ submissions: data || [] })
+    const submissions = await Promise.all((data || []).map(async sub => ({
+      ...sub,
+      evidence_files: await withSignedUrls(sub.evidence_files || []),
+    })))
+
+    res.json({ submissions })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -384,14 +526,19 @@ router.get('/submissions/:id', requireAdmin, async (req, res) => {
         partner_review_status, partner_review_notes, partner_reviewed_at,
         status, submitted_by, submitted_at, reviewed_by, reviewed_at, review_notes,
         outcome, more_info_request, more_info_response,
-        evidence_files(id, file_name, file_type, file_size, file_url, storage_path)
+        evidence_files(id, file_name, file_type, file_size, storage_path)
       `)
       .eq('id', id)
       .single()
 
     if (error || !data) return res.status(404).json({ error: 'Submission not found' })
 
-    res.json({ submission: data })
+    res.json({
+      submission: {
+        ...data,
+        evidence_files: await withSignedUrls(data.evidence_files || []),
+      },
+    })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -408,10 +555,10 @@ router.patch('/submissions/:id/review', requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'action must be approve, reject, or more_info' })
     }
 
-    // Fetch submission to get submitter id
+    // Fetch submission — the project fields are needed to mint the projects row.
     const { data: sub, error: fetchErr } = await supabase
       .from('project_submissions')
-      .select('id, submitted_by, title, partner_user_id')
+      .select('id, submitted_by, title, partner_user_id, project_id, element, category, description, location, tree_count, start_date, end_date')
       .eq('id', id)
       .single()
 
@@ -432,6 +579,73 @@ router.patch('/submissions/:id/review', requireAdmin, async (req, res) => {
     } else if (action === 'more_info') {
       updatePayload.status             = 'more_info'
       updatePayload.more_info_request  = moreInfoRequest || reviewNotes || ''
+    }
+
+    // Approving a submission is what brings the project into existence. Until
+    // this ran, nothing in the codebase ever inserted a projects row, so approved
+    // projects never reached the marketplace, the partner portal or the field app.
+    let createdProjectId = null
+    let projectWarning   = null
+
+    if (action === 'approve' && !sub.project_id) {
+      try {
+        const slug = await uniqueProjectSlug(sub.title)
+
+        // projects.partner is the public "delivered by" label and is NOT NULL.
+        // Most submissions come from a partner org; the rest (an individual or
+        // business submitting their own project) fall back to the submitter's
+        // display name, so approval never fails for want of a label.
+        const { data: partnerProfile } = await supabase
+          .from('partner_profiles')
+          .select('org_name')
+          .eq('user_id', sub.submitted_by)
+          .maybeSingle()
+
+        let partnerLabel = partnerProfile?.org_name || null
+        if (!partnerLabel) {
+          const { data: submitter } = await supabase
+            .from('profiles')
+            .select('display_name, name')
+            .eq('auth_id', sub.submitted_by)
+            .maybeSingle()
+          partnerLabel = submitter?.display_name || submitter?.name || 'Unattributed'
+        }
+
+        const { error: projErr } = await supabase.from('projects').insert({
+          id:            slug,
+          slug,
+          name:          sub.title,
+          element:       (sub.element || 'earth').toLowerCase(),
+          // projects.category and .location are NOT NULL. Category is required in
+          // the P3 form, but older drafts and API callers may omit it, and a
+          // missing label must never block an otherwise valid approval.
+          category:      sub.category || 'Uncategorised',
+          location:      sub.location || 'Not specified',
+          description:   sub.description || null,
+          partner:       partnerLabel,
+          total_trees:   sub.tree_count || 0,
+          funded_trees:  0,
+          funders_count: 0,
+          funded_amount: 0,
+          tco2e:         0,
+          t_co2e:        0,
+          evidence_count: 0,
+          verified:      updatePayload.outcome === 'verified',
+          verification_status: updatePayload.outcome === 'verified' ? 'verified' : 'self_reported',
+          has_ledger_entry: false,
+          active:        true,
+          status:        'active',
+        })
+
+        if (projErr) throw new Error(projErr.message)
+
+        createdProjectId    = slug
+        updatePayload.project_id = slug
+      } catch (e) {
+        // Don't fail the review itself — record it and let the admin retry.
+        projectWarning = `Submission approved, but the project record could not be created: ${e.message}`
+        console.error('[admin/submissions review] project creation failed:', e.message)
+      }
     }
 
     const { error: updateErr } = await supabase
@@ -470,7 +684,13 @@ router.patch('/submissions/:id/review', requireAdmin, async (req, res) => {
       }
     }
 
-    res.json({ success: true, status: updatePayload.status, outcome: updatePayload.outcome || null })
+    res.json({
+      success:   true,
+      status:    updatePayload.status,
+      outcome:   updatePayload.outcome || null,
+      projectId: createdProjectId,
+      warning:   projectWarning,
+    })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -482,15 +702,25 @@ router.get('/users', requireAdmin, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('profiles')
-      .select('id, display_name, email, role, status, created_at, last_seen_at')
+      .select('id, auth_id, display_name, role, status, created_at, last_seen_at')
       .order('created_at', { ascending: false })
 
     if (error) throw error
 
+    // Fetch emails from auth.users via admin API for profiles that have auth_id
+    const authIds = (data || []).map(u => u.auth_id).filter(Boolean)
+    let emailMap = {}
+    if (authIds.length > 0) {
+      const { users: authUsers } = await listAllAuthUsers()
+      if (authUsers) {
+        authUsers.forEach(au => { emailMap[au.id] = au.email })
+      }
+    }
+
     res.json({
       users: (data || []).map(u => ({
         id:        u.id,
-        email:     u.email || '—',
+        email:     (u.auth_id && emailMap[u.auth_id]) || '—',
         role:      u.role  || 'individual',
         name:      u.display_name || '—',
         createdAt: new Date(u.created_at).toLocaleDateString('en-GB'),
@@ -634,7 +864,7 @@ router.get('/ledger', requireAdmin, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('ledger_entries')
-      .select('id, trees_verified, co2e_verified, approved_at, public_hash, superseded_by, approved_by, projects(title), profiles(display_name)')
+      .select('id, project_id, project, funder, trees, t_co2e, trees_verified, co2e_verified, verified, approved_at, public_hash, superseded_by, approved_by, review_notes, projects(name)')
       .order('approved_at', { ascending: false })
       .limit(200)
 
@@ -642,17 +872,18 @@ router.get('/ledger', requireAdmin, async (req, res) => {
 
     res.json({
       entries: (data || []).map(e => ({
-        id:          e.id,
-        project:     e.projects?.title || '—',
-        projectId:   e.project_id,
-        funder:      e.profiles?.display_name || '—',
-        trees:       e.trees_verified || 0,
-        tCo2e:       e.co2e_verified  || 0,
-        verified:    true,
-        date:        e.approved_at ? new Date(e.approved_at).toLocaleDateString('en-GB') : '—',
-        publicHash:  e.public_hash || '',
+        id:           e.id,
+        project:      e.projects?.name || e.project || '—',
+        projectId:    e.project_id,
+        funder:       e.funder || '—',
+        trees:        e.trees_verified || e.trees || 0,
+        tCo2e:        Number(e.co2e_verified || e.t_co2e) || 0,
+        verified:     e.verified || false,
+        date:         e.approved_at ? new Date(e.approved_at).toLocaleDateString('en-GB') : (e.date || '—'),
+        publicHash:   e.public_hash || '',
         supersededBy: e.superseded_by || null,
-        approvedBy:  e.approved_by || null,
+        approvedBy:   e.approved_by || null,
+        reviewNotes:  e.review_notes || '',
       }))
     })
   } catch (err) {
@@ -712,20 +943,20 @@ router.get('/finance', requireAdmin, async (req, res) => {
   try {
     const { data: fundings } = await supabase
       .from('individual_fundings')
-      .select('id, amount, currency, user_id, project_id, status, created_at, profiles(display_name), projects(title)')
-      .order('created_at', { ascending: false })
+      .select('id, amount_paid, user_id, project_id, verification_status, funded_at, funder_name, trees_funded, projects(name)')
+      .order('funded_at', { ascending: false })
       .limit(200)
 
     const transactions = (fundings || []).map(f => ({
       id:       f.id,
       type:     'funding',
-      amount:   f.amount || 0,
-      currency: f.currency || 'GBP',
-      from:     f.profiles?.display_name || f.user_id || '—',
+      amount:   Number(f.amount_paid) || 0,
+      currency: 'GBP',
+      from:     f.funder_name || f.user_id || '—',
       to:       'Five Elements',
-      project:  f.projects?.title || '—',
-      status:   f.status || 'completed',
-      date:     new Date(f.created_at).toLocaleDateString('en-GB'),
+      project:  f.projects?.name || '—',
+      status:   f.verification_status === 'verified' ? 'completed' : f.verification_status || 'pending',
+      date:     f.funded_at ? new Date(f.funded_at).toLocaleDateString('en-GB') : '—',
     }))
 
     const totalRevenue = transactions.reduce((s, t) => s + (t.type === 'funding' ? t.amount : 0), 0)
@@ -898,9 +1129,12 @@ router.post('/tasks', requireAdminOrPartner, async (req, res) => {
       .eq('auth_id', assignee_id)
       .maybeSingle()
 
+    // Field users are the point of a survey task — they were previously excluded,
+    // so a task had to be created for a partner and then reassigned by hand.
     const assigneeRoles = assigneeProfile ? [assigneeProfile.role, ...(assigneeProfile.roles || [])] : []
-    if (!assigneeProfile || !assigneeRoles.some(r => ['admin', 'partner'].includes(r))) {
-      return res.status(400).json({ error: 'assignee_id must belong to an Admin or Partner account' })
+    const ASSIGNABLE = ['admin', 'partner', 'field_user', 'individual']
+    if (!assigneeProfile || !assigneeRoles.some(r => ASSIGNABLE.includes(r))) {
+      return res.status(400).json({ error: 'assignee_id must belong to a known Admin, Partner or Field account' })
     }
 
     // Generate task_code
@@ -1014,6 +1248,16 @@ router.put('/tasks/:id', requireAdminOrPartner, async (req, res) => {
 router.delete('/tasks/:id', requireAdminOrPartner, async (req, res) => {
   try {
     const { id } = req.params
+
+    // An approved task is the trigger for a ledger entry (see publishCaptureToLedger).
+    // Deleting it afterward would erase the record of why that evidence exists while
+    // leaving the ledger entry and the project counters it moved untouched — the same
+    // integrity gap "evidence is read-only after capture" exists to prevent elsewhere.
+    const { data: task } = await supabase.from('tasks').select('status').eq('id', id).maybeSingle()
+    if (task?.status === 'approved') {
+      return res.status(409).json({ error: 'Approved tasks cannot be deleted — their evidence is already on the ledger.' })
+    }
+
     const { error } = await supabase.from('tasks').delete().eq('id', id)
     if (error) throw error
     res.json({ success: true })
@@ -1047,13 +1291,17 @@ router.get('/tasks/assignable-users', requireAdminOrPartner, async (req, res) =>
       return roles.some(r => matchRoles.includes(r))
     })
 
-    // For the field pool, only users who have actually done real field work — i.e. have
-    // at least one tree_records row of their own. Excludes accounts that merely signed up
-    // or logged in but never captured anything.
+    // For the field pool: anyone explicitly given the field_user role is assignable
+    // straight away — a partner has just created them and needs to hand them work.
+    // Plain 'individual' accounts still have to show real activity (at least one
+    // tree_records row) before they clutter the list.
     if (pool === 'field') {
       const { data: activeIds } = await supabase.from('tree_records').select('user_id')
       const capturedIds = new Set((activeIds || []).map(t => t.user_id))
-      assignable = assignable.filter(p => capturedIds.has(p.auth_id))
+      assignable = assignable.filter(p => {
+        const roles = [p.role, ...(p.roles || [])]
+        return roles.includes('field_user') || capturedIds.has(p.auth_id)
+      })
     }
 
     res.json({
@@ -1083,9 +1331,12 @@ router.post('/tasks/bulk-generate', requireAdminOrPartner, async (req, res) => {
       .select('auth_id, role, roles')
       .eq('auth_id', assignee_id)
       .maybeSingle()
+    // Field users are the point of a survey task — they were previously excluded,
+    // so a task had to be created for a partner and then reassigned by hand.
     const assigneeRoles = assigneeProfile ? [assigneeProfile.role, ...(assigneeProfile.roles || [])] : []
-    if (!assigneeProfile || !assigneeRoles.some(r => ['admin', 'partner'].includes(r))) {
-      return res.status(400).json({ error: 'assignee_id must belong to an Admin or Partner account' })
+    const ASSIGNABLE = ['admin', 'partner', 'field_user', 'individual']
+    if (!assigneeProfile || !assigneeRoles.some(r => ASSIGNABLE.includes(r))) {
+      return res.status(400).json({ error: 'assignee_id must belong to a known Admin, Partner or Field account' })
     }
 
     const { data: trees, error: treeErr } = await supabase
@@ -1148,41 +1399,7 @@ router.post('/tasks/bulk-generate', requireAdminOrPartner, async (req, res) => {
 })
 
 // ─── Task Review (Admin + Partner) ────────────────────────────────────────────
-
-// Auth guard — admin OR partner
-async function requireAdminOrPartner(req, res, next) {
-  const token = (req.headers.authorization || '').replace('Bearer ', '')
-  if (!token) return res.status(401).json({ error: 'Unauthorized' })
-
-  const { data: { user }, error } = await supabase.auth.getUser(token)
-  if (error || !user) return res.status(401).json({ error: 'Unauthorized' })
-
-  let profile = null
-  const { data: byAuthId } = await supabase
-    .from('profiles')
-    .select('role, id')
-    .eq('auth_id', user.id)
-    .maybeSingle()
-
-  if (byAuthId) {
-    profile = byAuthId
-  } else {
-    const { data: byId } = await supabase
-      .from('profiles')
-      .select('role, id')
-      .eq('id', user.id)
-      .maybeSingle()
-    profile = byId
-  }
-
-  if (!profile || !['admin', 'partner'].includes(profile.role)) {
-    return res.status(403).json({ error: 'Forbidden — admin or partner only' })
-  }
-
-  req.reviewerId = user.id
-  req.reviewerRole = profile.role
-  next()
-}
+// requireAdminOrPartner is imported above, alongside the other admin helpers.
 
 // GET /api/admin/tasks/pending-review — tasks completed by field users, awaiting review
 router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
@@ -1259,7 +1476,7 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, async (req, res) => {
 
     const { data: task } = await supabase
       .from('tasks')
-      .select('assignee_id, name, task_code')
+      .select('assignee_id, name, task_code, tree_id, project_id')
       .eq('id', id)
       .single()
 
@@ -1277,6 +1494,19 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, async (req, res) => {
 
     if (error) throw error
 
+    // Approval is the verification moment — publish the capture to the ledger.
+    const ledger = await publishCaptureToLedger({
+      taskId:       id,
+      treeId:       task.tree_id,
+      projectId:    task.project_id,
+      reviewerId:   req.reviewerId,
+      reviewNotes:  review_notes,
+    })
+
+    if (!ledger.ok && ledger.error) {
+      console.error('[tasks/approve] ledger publish failed:', ledger.error)
+    }
+
     // Notify field user
     if (task.assignee_id) {
       await createNotification({
@@ -1288,7 +1518,7 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, async (req, res) => {
       })
     }
 
-    res.json({ success: true })
+    res.json({ success: true, ledger })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }

@@ -1,7 +1,18 @@
 const express = require('express')
 const router  = express.Router()
+const { createClient } = require('@supabase/supabase-js')
 const supabase = require('../supabaseClient')
 const { sendWelcomeEmail, sendRoleAddedEmail } = require('../services/emailService')
+
+// Built once at startup and reused — the two call sites below used to build
+// this same client fresh on every request (every login, and every signup
+// that falls back to anon signUp), which is needless per-request setup for
+// a client whose config never changes.
+const anonClient = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY,
+  { auth: { autoRefreshToken: false, persistSession: false } }
+)
 
 // ── POST /api/auth/signup ─────────────────────────────────────────────────────
 // Body: { fullName, email, password }
@@ -36,12 +47,6 @@ router.post('/signup', async (req, res) => {
     authErr  = result.error
   } else {
     // Anon signUp — sends confirmation email with redirect back to /welcome
-    const { createClient } = require('@supabase/supabase-js')
-    const anonClient = createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_ANON_KEY,
-      { auth: { autoRefreshToken: false, persistSession: false } }
-    )
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
     const result = await anonClient.auth.signUp({
       email,
@@ -150,13 +155,6 @@ router.post('/login', async (req, res) => {
   }
 
   try {
-    const { createClient } = require('@supabase/supabase-js')
-    const anonClient = createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_ANON_KEY,
-      { auth: { autoRefreshToken: false, persistSession: false } }
-    )
-
     const { data, error } = await anonClient.auth.signInWithPassword({
       email: email.toLowerCase().trim(),
       password,
