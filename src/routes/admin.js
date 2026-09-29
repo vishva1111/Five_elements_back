@@ -24,13 +24,28 @@ router.get('/queue', requireAdmin, async (req, res) => {
   try {
     const items = []
 
-    // Pending evidence submissions
-    const { data: evidence } = await supabase
-      .from('evidence_files')
-      .select('id, submission_id, created_at, project_submissions(project_id, submitted_by, projects(title, element))')
-      .eq('status', 'pending_review')
-      .order('created_at', { ascending: true })
-      .limit(50)
+    // Three independent reads — none depends on another's result, so they run
+    // concurrently instead of paying for three round trips back to back.
+    const [{ data: evidence }, { data: projects }, { data: partners }] = await Promise.all([
+      supabase
+        .from('evidence_files')
+        .select('id, submission_id, created_at, project_submissions(project_id, submitted_by, projects(title, element))')
+        .eq('status', 'pending_review')
+        .order('created_at', { ascending: true })
+        .limit(50),
+      supabase
+        .from('project_submissions')
+        .select('id, submitted_by, created_at, projects(title, element)')
+        .eq('status', 'pending_review')
+        .order('created_at', { ascending: true })
+        .limit(50),
+      supabase
+        .from('partner_profiles')
+        .select('id, org_name, user_id, applied_at, contact_name, contact_email')
+        .eq('status', 'pending')
+        .order('applied_at', { ascending: true })
+        .limit(50),
+    ])
 
     if (evidence) {
       evidence.forEach(e => {
@@ -47,14 +62,6 @@ router.get('/queue', requireAdmin, async (req, res) => {
       })
     }
 
-    // Pending project submissions
-    const { data: projects } = await supabase
-      .from('project_submissions')
-      .select('id, submitted_by, created_at, projects(title, element)')
-      .eq('status', 'pending_review')
-      .order('created_at', { ascending: true })
-      .limit(50)
-
     if (projects) {
       projects.forEach(p => {
         items.push({
@@ -68,14 +75,6 @@ router.get('/queue', requireAdmin, async (req, res) => {
         })
       })
     }
-
-    // Pending partner applications
-    const { data: partners } = await supabase
-      .from('partner_profiles')
-      .select('id, org_name, user_id, applied_at, contact_name, contact_email')
-      .eq('status', 'pending')
-      .order('applied_at', { ascending: true })
-      .limit(50)
 
     if (partners) {
       partners.forEach(p => {
@@ -780,18 +779,22 @@ router.get('/projects', requireAdminOrPartner, async (req, res) => {
   }
 })
 
-// GET /api/admin/tree-records — list tree records, optionally filtered by project
-// Used by the task-creation form ("link to tree") and the bulk task-generation flow.
+// GET /api/admin/tree-records — list tree records, optionally filtered by
+// project and/or health status. Used by the task-creation form ("link to
+// tree"), the bulk task-generation flow, and the Tree Records gallery page —
+// the extra columns and health_status filter here are for that last one; the
+// other two callers simply ignore fields and filters they don't ask for.
 router.get('/tree-records', requireAdminOrPartner, async (req, res) => {
   try {
-    const { project_id, limit } = req.query
+    const { project_id, health_status, limit } = req.query
     let query = supabase
       .from('tree_records')
-      .select('id, species, project_id, latitude, longitude, health_status, submitted_at')
+      .select('id, user_id, species, project_id, photo_url, latitude, longitude, health_status, notes, submitted_at, synced')
       .order('submitted_at', { ascending: false })
       .limit(limit ? parseInt(limit, 10) : 200)
 
     if (project_id) query = query.eq('project_id', project_id)
+    if (health_status) query = query.eq('health_status', health_status)
 
     const { data, error } = await query
     if (error) throw error
@@ -1063,37 +1066,32 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
     const { data, error } = await query
     if (error) throw error
 
-    // Enrich with assignee name + project name
+    // Enrich with assignee name + project name + tree photo. The three lookups
+    // below each key off `data` but not off each other, so they run concurrently
+    // instead of three round trips back to back.
     const profileIds = [...new Set((data || []).map(t => t.assignee_id).filter(Boolean))]
-    let profileMap = {}
-    if (profileIds.length > 0) {
-      const { data: profiles } = await supabase
-        .from('profiles')
-        .select('auth_id, id, display_name')
-        .in('auth_id', profileIds)
-      ;(profiles || []).forEach(p => { profileMap[p.auth_id] = p.display_name })
-    }
-
     const projectIds = [...new Set((data || []).map(t => t.project_id).filter(Boolean))]
-    let projectMap = {}
-    if (projectIds.length > 0) {
-      const { data: projects } = await supabase
-        .from('projects')
-        .select('id, name')
-        .in('id', projectIds)
-      ;(projects || []).forEach(p => { projectMap[p.id] = p.name })
-    }
+    const treeIds    = [...new Set((data || []).map(t => t.tree_id).filter(Boolean))]
 
-    // The photo the field user captured lives on the linked tree record, not the task.
-    const treeIds = [...new Set((data || []).map(t => t.tree_id).filter(Boolean))]
-    let treeMap = {}
-    if (treeIds.length > 0) {
-      const { data: trees } = await supabase
-        .from('tree_records')
-        .select('id, photo_url, species, health_status, submitted_at')
-        .in('id', treeIds)
-      ;(trees || []).forEach(tr => { treeMap[tr.id] = tr })
-    }
+    const [profilesRes, projectsRes, treesRes] = await Promise.all([
+      profileIds.length > 0
+        ? supabase.from('profiles').select('auth_id, id, display_name').in('auth_id', profileIds)
+        : Promise.resolve({ data: [] }),
+      projectIds.length > 0
+        ? supabase.from('projects').select('id, name').in('id', projectIds)
+        : Promise.resolve({ data: [] }),
+      // The photo the field user captured lives on the linked tree record, not the task.
+      treeIds.length > 0
+        ? supabase.from('tree_records').select('id, photo_url, species, health_status, submitted_at').in('id', treeIds)
+        : Promise.resolve({ data: [] }),
+    ])
+
+    const profileMap = {}
+    ;(profilesRes.data || []).forEach(p => { profileMap[p.auth_id] = p.display_name })
+    const projectMap = {}
+    ;(projectsRes.data || []).forEach(p => { projectMap[p.id] = p.name })
+    const treeMap = {}
+    ;(treesRes.data || []).forEach(tr => { treeMap[tr.id] = tr })
 
     res.json({
       tasks: (data || []).map(t => ({
@@ -1421,37 +1419,30 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
     const { data, error } = await query
     if (error) throw error
 
-    // Enrich with assignee name
+    // Same three-independent-lookups pattern as GET /tasks — run concurrently.
     const profileIds = [...new Set((data || []).map(t => t.assignee_id).filter(Boolean))]
-    let profileMap = {}
-    if (profileIds.length > 0) {
-      const { data: profiles } = await supabase
-        .from('profiles')
-        .select('auth_id, display_name')
-        .in('auth_id', profileIds)
-      ;(profiles || []).forEach(p => { profileMap[p.auth_id] = p.display_name })
-    }
-
     const projectIds = [...new Set((data || []).map(t => t.project_id).filter(Boolean))]
-    let projectMap = {}
-    if (projectIds.length > 0) {
-      const { data: projects } = await supabase
-        .from('projects')
-        .select('id, name')
-        .in('id', projectIds)
-      ;(projects || []).forEach(p => { projectMap[p.id] = p.name })
-    }
+    const treeIds    = [...new Set((data || []).map(t => t.tree_id).filter(Boolean))]
 
-    // The photo the field user captured lives on the linked tree record, not the task.
-    const treeIds = [...new Set((data || []).map(t => t.tree_id).filter(Boolean))]
-    let treeMap = {}
-    if (treeIds.length > 0) {
-      const { data: trees } = await supabase
-        .from('tree_records')
-        .select('id, photo_url, species, health_status')
-        .in('id', treeIds)
-      ;(trees || []).forEach(tr => { treeMap[tr.id] = tr })
-    }
+    const [profilesRes, projectsRes, treesRes] = await Promise.all([
+      profileIds.length > 0
+        ? supabase.from('profiles').select('auth_id, display_name').in('auth_id', profileIds)
+        : Promise.resolve({ data: [] }),
+      projectIds.length > 0
+        ? supabase.from('projects').select('id, name').in('id', projectIds)
+        : Promise.resolve({ data: [] }),
+      // The photo the field user captured lives on the linked tree record, not the task.
+      treeIds.length > 0
+        ? supabase.from('tree_records').select('id, photo_url, species, health_status').in('id', treeIds)
+        : Promise.resolve({ data: [] }),
+    ])
+
+    const profileMap = {}
+    ;(profilesRes.data || []).forEach(p => { profileMap[p.auth_id] = p.display_name })
+    const projectMap = {}
+    ;(projectsRes.data || []).forEach(p => { projectMap[p.id] = p.name })
+    const treeMap = {}
+    ;(treesRes.data || []).forEach(tr => { treeMap[tr.id] = tr })
 
     res.json({
       tasks: (data || []).map(t => ({

@@ -86,4 +86,29 @@ router.get('/', async (req, res) => {
   }
 })
 
+/**
+ * GET /api/dashboard/tree-records?user_id=...
+ * Recent tree records for one user — the Business dashboard's tree-records
+ * widget used to run this exact query directly against Supabase.
+ */
+router.get('/tree-records', async (req, res) => {
+  try {
+    const { user_id } = req.query
+    if (!user_id) return res.status(400).json({ error: 'user_id is required' })
+
+    const { data, error } = await supabase
+      .from('tree_records')
+      .select('id, photo_url, latitude, longitude, species, health_status, notes, submitted_at, synced, project_id')
+      .eq('user_id', user_id)
+      .order('submitted_at', { ascending: false })
+      .limit(50)
+
+    if (error) throw error
+    res.json({ records: data || [] })
+  } catch (err) {
+    console.error('[GET /api/dashboard/tree-records]', err.message)
+    res.status(500).json({ error: 'Failed to fetch tree records' })
+  }
+})
+
 module.exports = router

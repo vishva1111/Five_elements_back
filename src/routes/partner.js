@@ -615,20 +615,23 @@ router.get('/funders', requirePartner, async (req, res) => {
     const { projectIds } = await partnerScope(userId)
     if (projectIds.length === 0) return res.json({ funders: [] })
 
-    const { data: projects } = await supabase
-      .from('projects')
-      .select('id, name')
-      .in('id', projectIds)
-
-    const projectMap = Object.fromEntries((projects || []).map(p => [p.id, p.name]))
-
-    const { data: fundings, error } = await supabase
-      .from('individual_fundings')
-      .select('id, user_id, project_id, trees_funded, amount_paid, funded_at, public_attribution, funder_name')
-      .in('project_id', projectIds)
-      .order('funded_at', { ascending: false })
+    // Three reads that each key off projectIds alone — none depends on
+    // another's result, so they run concurrently.
+    const [{ data: projects }, { data: fundings, error }, { data: delivered }] = await Promise.all([
+      supabase.from('projects').select('id, name').in('id', projectIds),
+      supabase
+        .from('individual_fundings')
+        .select('id, user_id, project_id, trees_funded, amount_paid, funded_at, public_attribution, funder_name')
+        .in('project_id', projectIds)
+        .order('funded_at', { ascending: false }),
+      // Funded vs delivered vs outstanding — delivered counts approved evidence
+      // only, the same rule every other surface uses (P8-02, PG-05).
+      supabase.from('ledger_entries').select('trees_verified').in('project_id', projectIds),
+    ])
 
     if (error) throw error
+
+    const projectMap = Object.fromEntries((projects || []).map(p => [p.id, p.name]))
 
     // Funder type isn't stored on the funding row — derive it from the profile.
     const funderIds = [...new Set((fundings || []).map(f => f.user_id).filter(Boolean))]
@@ -659,13 +662,6 @@ router.get('/funders', requirePartner, async (req, res) => {
         anonymous,
       }
     })
-
-    // Funded vs delivered vs outstanding — delivered counts approved evidence
-    // only, the same rule every other surface uses (P8-02, PG-05).
-    const { data: delivered } = await supabase
-      .from('ledger_entries')
-      .select('trees_verified')
-      .in('project_id', projectIds)
 
     const fundedTotal = funders.reduce((sum, f) => sum + (f.treesFunded || 0), 0)
     const deliveredTotal = (delivered || []).reduce((sum, d) => sum + (d.trees_verified || 0), 0)
@@ -805,22 +801,25 @@ router.get('/team', requirePartner, async (req, res) => {
     if (error) throw error
 
     // Resolve everyone to their auth account in one pass, so the UI can offer
-    // "record a tree for this person" without a call per row.
+    // "record a tree for this person" without a call per row. Independent of
+    // the project-name lookup below, so both run concurrently.
     const needsLookup = (data || []).some(m => !m.user_id && m.email)
+    const projectIdsOnMembers = [...new Set((data || []).map(m => m.project_id).filter(Boolean))]
+
+    const [listed, projsRes] = await Promise.all([
+      needsLookup ? listAllAuthUsers() : Promise.resolve(null),
+      projectIdsOnMembers.length > 0
+        ? supabase.from('projects').select('id, name').in('id', projectIdsOnMembers)
+        : Promise.resolve({ data: [] }),
+    ])
+
     let byEmail = {}
-    if (needsLookup) {
-      const listed = await listAllAuthUsers()
+    if (listed) {
       byEmail = Object.fromEntries(
         (listed?.users || []).map(u => [String(u.email || '').toLowerCase(), u.id])
       )
     }
-
-    const projectIdsOnMembers = [...new Set((data || []).map(m => m.project_id).filter(Boolean))]
-    let projectNameMap = {}
-    if (projectIdsOnMembers.length > 0) {
-      const { data: projs } = await supabase.from('projects').select('id, name').in('id', projectIdsOnMembers)
-      projectNameMap = Object.fromEntries((projs || []).map(p => [p.id, p.name]))
-    }
+    const projectNameMap = Object.fromEntries((projsRes.data || []).map(p => [p.id, p.name]))
 
     const members = (data || []).map(m => {
       const authId = m.user_id || byEmail[String(m.email || '').toLowerCase()] || null
@@ -1583,17 +1582,28 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
     const onBehalfOf = b.user_id
     const projectId  = b.project_id
     const species    = (b.species || '').trim()
-    const latitude   = Number(b.latitude)
-    const longitude  = Number(b.longitude)
+    // Optional — the partner console files work from a desk and often has no
+    // GPS for the tree; TreeApp's own field capture (always on-site) is the
+    // geotagged path. Only validate range when a coordinate was actually sent.
+    const coord = (v) => {
+      const n = Number(v)
+      return Number.isFinite(n) ? n : null
+    }
+    const latitude  = b.latitude  !== undefined && b.latitude  !== '' ? coord(b.latitude)  : null
+    const longitude = b.longitude !== undefined && b.longitude !== '' ? coord(b.longitude) : null
 
     if (!onBehalfOf) return res.status(400).json({ error: 'Choose which user this tree belongs to' })
     if (!projectId)  return res.status(400).json({ error: 'Choose a project' })
     if (!species)    return res.status(400).json({ error: 'Species is required' })
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
-      return res.status(400).json({ error: 'Valid latitude and longitude are required' })
+    if ((b.latitude !== undefined && b.latitude !== '' && latitude === null) ||
+        (b.longitude !== undefined && b.longitude !== '' && longitude === null)) {
+      return res.status(400).json({ error: 'Coordinates must be numbers' })
     }
-    if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
-      return res.status(400).json({ error: 'Coordinates are out of range' })
+    if (latitude !== null && (latitude < -90 || latitude > 90)) {
+      return res.status(400).json({ error: 'Latitude must be between -90 and 90' })
+    }
+    if (longitude !== null && (longitude < -180 || longitude > 180)) {
+      return res.status(400).json({ error: 'Longitude must be between -180 and 180' })
     }
 
     const { data: profile } = await supabase

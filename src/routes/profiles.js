@@ -10,6 +10,43 @@ const HERO_GRADIENTS = [
   'linear-gradient(135deg,#2B5341,#3D7A5C)',
 ]
 
+/**
+ * GET /api/profiles — community directory list, for the Profiles browse page.
+ * Query params: type ('individual' | 'business' | 'All')
+ * Only profiles with trees > 0 (real users with actual impact) are shown.
+ */
+router.get('/', async (req, res) => {
+  try {
+    const { type } = req.query
+
+    let query = supabase
+      .from('profiles')
+      .select('id, name, type, location, avatar, trees, t_co2e, created_at')
+      .order('trees', { ascending: false })
+      .gt('trees', 0)
+
+    if (type && type !== 'All') query = query.eq('type', type)
+
+    const { data, error } = await query
+    if (error) throw error
+
+    const profiles = (data || []).map(r => ({
+      id:       r.id,
+      name:     r.name,
+      type:     r.type?.toLowerCase() === 'business' ? 'organisation' : 'individual',
+      location: r.location,
+      avatar:   r.avatar || '',
+      trees:    r.trees,
+      tCO2e:    Number(r.t_co2e) || 0,
+    }))
+
+    res.json({ data: profiles })
+  } catch (err) {
+    console.error('[GET /api/profiles]', err)
+    res.status(500).json({ error: 'Failed to fetch profiles' })
+  }
+})
+
 // GET /api/profiles/:slug
 router.get('/:slug', async (req, res) => {
   try {
