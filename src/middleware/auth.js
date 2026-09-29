@@ -13,15 +13,20 @@
  *   req.role    — from profiles.role column
  */
 
-const { createClient } = require('@supabase/supabase-js')
+const { createRemoteJWKSet, jwtVerify } = require('jose')
 const supabase = require('../supabaseClient')
 
-// Use anon key for JWT verification — auth.getUser() works with anon key
-const authClient = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY,
-  { auth: { autoRefreshToken: false, persistSession: false } }
-)
+// Verifies the JWT's signature locally against Supabase's public signing key,
+// instead of a network round trip to Supabase Auth on every single request
+// (auth.getUser() calls /auth/v1/user remotely — ~250ms, paid by every route
+// on top of the profiles lookup below). This project signs with ES256
+// (asymmetric), so the key here is a PUBLIC verification key, not a secret —
+// jose fetches it once from Supabase's JWKS endpoint and caches it for the
+// life of the process, so only the very first request pays the network cost.
+// Trade-off: a token stays valid until it expires even if the session were
+// somehow revoked server-side in that window — the same as before, since
+// Supabase doesn't blacklist access tokens on sign-out either way.
+const JWKS = createRemoteJWKSet(new URL(`${process.env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`))
 
 /**
  * requireAuth — verifies the Bearer JWT from the Authorization header.
@@ -35,13 +40,15 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Missing auth token' })
   }
 
-  // Verify the JWT with Supabase (use anon key client — works for JWT verification)
-  const { data: { user }, error } = await authClient.auth.getUser(token)
-
-  if (error || !user) {
-    console.error('[requireAuth] getUser error:', error?.message, '| token prefix:', token?.slice(0, 20))
+  let payload
+  try {
+    ;({ payload } = await jwtVerify(token, JWKS))
+  } catch (error) {
+    console.error('[requireAuth] JWT verify error:', error?.message, '| token prefix:', token?.slice(0, 20))
     return res.status(401).json({ error: 'Invalid or expired token', detail: error?.message })
   }
+
+  const userId = payload.sub
 
   // Fetch role from profiles table using auth_id (UUID) column.
   // profiles.id is a text slug; auth_id links to auth.users.id (UUID).
@@ -50,7 +57,7 @@ async function requireAuth(req, res, next) {
   const { data: profileByAuthId } = await supabase
     .from('profiles')
     .select('role, id')
-    .eq('auth_id', user.id)
+    .eq('auth_id', userId)
     .maybeSingle()
 
   if (profileByAuthId) {
@@ -60,13 +67,13 @@ async function requireAuth(req, res, next) {
     const { data: profileById } = await supabase
       .from('profiles')
       .select('role, id')
-      .eq('id', user.id)
+      .eq('id', userId)
       .maybeSingle()
     profile = profileById
   }
 
-  req.userId    = user.id
-  req.userEmail = user.email
+  req.userId    = userId
+  req.userEmail = payload.email
   req.role      = profile?.role || 'individual'
 
   next()

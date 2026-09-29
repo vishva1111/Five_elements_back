@@ -166,6 +166,7 @@ router.get('/:slug', async (req, res) => {
       verified: p.verified,
       status: p.status,
       createdAt: p.created_at,
+      coverImage: p.cover_image || null,
     })
   } catch (err) {
     console.error('[GET /api/projects/:slug]', err.message)
