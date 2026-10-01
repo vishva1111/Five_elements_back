@@ -34,9 +34,19 @@ const sheetUpload = multer({
   limits: { fileSize: 10 * 1024 * 1024, files: 1 },
 })
 
+// Business KYC documents (GST certificate, PAN card, …): PDFs or images.
+const businessDocUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 5 },
+  fileFilter: (req, file, cb) => {
+    const ok = /^(application\/pdf|image\/(png|jpe?g|webp))$/.test(file.mimetype)
+    cb(ok ? null : new Error('Only PDF, PNG, JPG or WEBP files are allowed'), ok)
+  },
+})
+
 const { createNotification } = require('./notifications')
 const { sendAccountCreatedEmail } = require('../services/emailService')
-const { withSignedUrls } = require('../services/evidenceUrls')
+const { withSignedUrls, signEvidencePath, BUCKET: EVIDENCE_BUCKET } = require('../services/evidenceUrls')
 const { parseTreeSheet, templateCsv, MAX_ROWS } = require('../services/treeImport')
 const { parseDonorSheet, templateCsv: donorTemplateCsv } = require('../services/donorImport')
 const { recordFunding } = require('../services/funding')
@@ -821,6 +831,9 @@ router.get('/team', requirePartner, async (req, res) => {
     }
     const projectNameMap = Object.fromEntries((projsRes.data || []).map(p => [p.id, p.name]))
 
+    const businessEmails = [...new Set((data || []).filter(m => m.role === 'business').map(m => String(m.email || '').toLowerCase()))]
+    const businessMap = await businessDetailsFor(profile.id, businessEmails)
+
     const members = (data || []).map(m => {
       const authId = m.user_id || byEmail[String(m.email || '').toLowerCase()] || null
       return {
@@ -836,6 +849,7 @@ router.get('/team', requirePartner, async (req, res) => {
         projectId:    m.project_id || null,
         projectName:  m.project_id ? (projectNameMap[m.project_id] || m.project_id) : null,
         tempPassword: m.temp_password || null,
+        business:     m.role === 'business' ? (businessMap[String(m.email || '').toLowerCase()] || null) : null,
       }
     })
 
@@ -845,6 +859,58 @@ router.get('/team', requirePartner, async (req, res) => {
     res.status(500).json({ error: 'Failed to load team' })
   }
 })
+
+
+// ── Business KYC (GST / PAN / address / documents) ───────────────────────────
+// Stored in business_details (migration 007_business_details.sql), keyed by
+// partner + email because one Business user can have a team row per project.
+const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/
+const PAN_RE   = /^[A-Z]{5}[0-9]{4}[A-Z]$/
+
+/** Normalises and validates business details; returns { value } or { error }. */
+function parseBusinessDetails(body, { required }) {
+  const gst     = String(body.gst_number || '').toUpperCase().replace(/\s+/g, '')
+  const pan     = String(body.pan_number || '').toUpperCase().replace(/\s+/g, '')
+  const address = String(body.address || '').trim()
+
+  if (required) {
+    if (!gst)     return { error: 'GST number is required for a Business user' }
+    if (!pan)     return { error: 'PAN number is required for a Business user' }
+    if (!address) return { error: 'Address is required for a Business user' }
+  }
+  if (gst && !GSTIN_RE.test(gst)) return { error: 'GST number must be a valid 15-character GSTIN (e.g. 24ABCDE1234F1Z5)' }
+  if (pan && !PAN_RE.test(pan))   return { error: 'PAN number must be 10 characters (e.g. ABCDE1234F)' }
+  // A GSTIN embeds the PAN at characters 3–12.
+  if (gst && pan && gst.slice(2, 12) !== pan) return { error: 'PAN does not match the PAN inside the GST number' }
+
+  return { value: { gst_number: gst || null, pan_number: pan || null, address: address || null } }
+}
+
+async function businessDetailsTableReady() {
+  const { error } = await supabase.from('business_details').select('id').limit(1)
+  return !error
+}
+
+async function businessDetailsFor(partnerId, emails) {
+  if (emails.length === 0) return {}
+  const { data, error } = await supabase
+    .from('business_details')
+    .select('email, gst_number, pan_number, address, documents')
+    .eq('partner_id', partnerId)
+    .in('email', emails)
+  if (error) return {}
+  const out = {}
+  for (const row of data || []) {
+    const docs = await Promise.all((row.documents || []).map(async d => ({
+      name: d.name, size: d.size, type: d.type, uploadedAt: d.uploadedAt, path: d.path,
+      url: await signEvidencePath(d.path),
+    })))
+    out[String(row.email).toLowerCase()] = {
+      gstNumber: row.gst_number, panNumber: row.pan_number, address: row.address, documents: docs,
+    }
+  }
+  return out
+}
 
 // ── POST /api/partner/team/invite ─────────────────────────────────────────────
 router.post('/team/invite', requirePartner, async (req, res) => {
@@ -892,6 +958,17 @@ router.post('/team/invite', requirePartner, async (req, res) => {
     }
 
     const email = String(rawEmail).toLowerCase().trim()
+
+    // Business users carry GST / PAN / address — checked before any account is made.
+    let business = null
+    if (role === 'business') {
+      const parsed = parseBusinessDetails(req.body, { required: true })
+      if (parsed.error) return res.status(400).json({ error: parsed.error })
+      if (!(await businessDetailsTableReady())) {
+        return res.status(400).json({ error: 'Business details need migration 007_business_details.sql to be run first.' })
+      }
+      business = parsed.value
+    }
 
     const { data: profile } = await supabase
       .from('partner_profiles')
@@ -962,7 +1039,7 @@ router.post('/team/invite', requirePartner, async (req, res) => {
         auth_id:        authUser.id,
         display_name:   displayName,
         name:           displayName,
-        type:           'Individual',   // profiles_type_check allows Individual | Business
+        type:           role === 'business' ? 'Business' : 'Individual',   // profiles_type_check allows Individual | Business
         location:       '',
         avatar:         '',
         trees:          0,
@@ -1054,6 +1131,14 @@ router.post('/team/invite', requirePartner, async (req, res) => {
       throw error
     }
 
+    // ── 3b. Business KYC details. ───────────────────────────────────────────
+    if (business) {
+      const { error: bizErr } = await supabase
+        .from('business_details')
+        .upsert({ partner_id: profile.id, email, ...business, updated_at: new Date().toISOString() }, { onConflict: 'partner_id,email' })
+      if (bizErr) console.error('[partner/team/invite] business details not saved:', bizErr.message)
+    }
+
     // ── 4. Tell them. ───────────────────────────────────────────────────────
     if (tempPassword) {
       await sendAccountCreatedEmail({
@@ -1088,6 +1173,113 @@ router.post('/team/invite', requirePartner, async (req, res) => {
   } catch (err) {
     console.error('[partner/team/invite]', err)
     res.status(500).json({ error: 'Failed to send invite' })
+  }
+})
+
+
+// ── PUT /api/partner/team/:id/business — update GST / PAN / address ──────────
+router.put('/team/:id/business', requirePartner, async (req, res) => {
+  try {
+    const profile = await partnerProfileFor(req.userId)
+    if (!profile) return res.status(404).json({ error: 'Partner profile not found' })
+    const member = await memberInOrg(profile.id, req.params.id)
+    if (!member || member.role !== 'business') return res.status(404).json({ error: 'Business user not found' })
+
+    const parsed = parseBusinessDetails(req.body, { required: true })
+    if (parsed.error) return res.status(400).json({ error: parsed.error })
+
+    const { error } = await supabase
+      .from('business_details')
+      .upsert({ partner_id: profile.id, email: String(member.email).toLowerCase(), ...parsed.value, updated_at: new Date().toISOString() }, { onConflict: 'partner_id,email' })
+    if (error) {
+      if (error.code === '42P01') return res.status(400).json({ error: 'Business details need migration 007_business_details.sql to be run first.' })
+      throw error
+    }
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[partner/team/:id/business PUT]', err)
+    res.status(500).json({ error: err.message || 'Failed to save business details' })
+  }
+})
+
+// ── POST /api/partner/team/:id/documents — optional KYC documents ────────────
+router.post('/team/:id/documents', requirePartner, (req, res, next) => {
+  businessDocUpload.array('files', 5)(req, res, err => {
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Each file must be 10 MB or smaller' : err.message })
+    next()
+  })
+}, async (req, res) => {
+  try {
+    const profile = await partnerProfileFor(req.userId)
+    if (!profile) return res.status(404).json({ error: 'Partner profile not found' })
+    const member = await memberInOrg(profile.id, req.params.id)
+    if (!member || member.role !== 'business') return res.status(404).json({ error: 'Business user not found' })
+    if (!req.files?.length) return res.status(400).json({ error: 'Choose at least one file' })
+
+    const email = String(member.email).toLowerCase()
+    const { data: existing, error: readErr } = await supabase
+      .from('business_details')
+      .select('documents')
+      .eq('partner_id', profile.id)
+      .eq('email', email)
+      .maybeSingle()
+    if (readErr) {
+      if (readErr.code === '42P01') return res.status(400).json({ error: 'Business details need migration 007_business_details.sql to be run first.' })
+      throw readErr
+    }
+
+    const uploaded = []
+    for (const f of req.files) {
+      const safe = f.originalname.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(-80)
+      const path = `business-docs/${profile.id}/${email.replace(/[^a-z0-9]+/g, '_')}/${Date.now()}_${safe}`
+      const { error: upErr } = await supabase.storage.from(EVIDENCE_BUCKET).upload(path, f.buffer, { contentType: f.mimetype, upsert: false })
+      if (upErr) return res.status(500).json({ error: `Upload failed for ${f.originalname}: ${upErr.message}` })
+      uploaded.push({ name: f.originalname, path, size: f.size, type: f.mimetype, uploadedAt: new Date().toISOString() })
+    }
+
+    const documents = [...(existing?.documents || []), ...uploaded]
+    const { error } = await supabase
+      .from('business_details')
+      .upsert({ partner_id: profile.id, email, documents, updated_at: new Date().toISOString() }, { onConflict: 'partner_id,email' })
+    if (error) throw error
+
+    res.status(201).json({ uploaded: uploaded.length })
+  } catch (err) {
+    console.error('[partner/team/:id/documents POST]', err)
+    res.status(500).json({ error: err.message || 'Failed to upload documents' })
+  }
+})
+
+// ── DELETE /api/partner/team/:id/documents?path=… — remove one document ──────
+router.delete('/team/:id/documents', requirePartner, async (req, res) => {
+  try {
+    const profile = await partnerProfileFor(req.userId)
+    if (!profile) return res.status(404).json({ error: 'Partner profile not found' })
+    const member = await memberInOrg(profile.id, req.params.id)
+    if (!member || member.role !== 'business') return res.status(404).json({ error: 'Business user not found' })
+
+    const email = String(member.email).toLowerCase()
+    const target = String(req.query.path || '')
+    const { data: existing } = await supabase
+      .from('business_details')
+      .select('documents')
+      .eq('partner_id', profile.id)
+      .eq('email', email)
+      .maybeSingle()
+    const docs = existing?.documents || []
+    if (!docs.some(d => d.path === target)) return res.status(404).json({ error: 'Document not found' })
+
+    await supabase.storage.from(EVIDENCE_BUCKET).remove([target])
+    const { error } = await supabase
+      .from('business_details')
+      .update({ documents: docs.filter(d => d.path !== target), updated_at: new Date().toISOString() })
+      .eq('partner_id', profile.id)
+      .eq('email', email)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[partner/team/:id/documents DELETE]', err)
+    res.status(500).json({ error: err.message || 'Failed to remove document' })
   }
 })
 
@@ -1419,6 +1611,117 @@ router.get('/team-users', requirePartner, async (req, res) => {
 // Accepts multipart (with an optional photo) or plain JSON.
 // partnerOwnedUserIds is imported above, alongside the other partner helpers.
 
+// ── Tree species reference (Action listing / Add trees) ─────────────────────
+// Served from the tree_species table (migration 006_tree_species.sql). Until
+// that table exists, the same built-in list is served so the console still works.
+const DEFAULT_TREE_SPECIES = [
+  ['Teak', 'Tectona grandis L.', 46], ['Mahogany', 'Swietenia macrophylla', 40],
+  ['Khaya', 'Khaya senegalensis', 36], ['Seesam', 'Dalbergia latifolia', 35],
+  ['Arjun Sadad', 'Terminalia arjuna', 30], ['Rain Tree', 'Samanea saman', 28.8],
+  ['Vad', 'Ficus benghalensis', 28], ['Baheda', 'Terminalia bellirica', 28],
+  ['Jackfruit', 'Artocarpus heterophyllus', 25], ['Siras', 'Albizia lebbeck', 22.5],
+  ['Aamba', 'Mangifera indica', 22], ['Piplo', 'Ficus religiosa', 21.5],
+  ['Amla', 'Phyllanthus emblica', 20], ['Jamun', 'Syzygium cumini', 20],
+  ['Acacia', 'Acacia auriculiformis', 20], ['Kigelia (Sausage Tree)', 'Kigelia africana', 20],
+  ['Saag', 'Tectona grandis', 19], ['Mahua', 'Madhuca longifolia', 18],
+  ['Biyo', 'Pterocarpus marsupium', 17], ['Flame of the Forest', 'Butea monosperma', 15],
+  ['Gunda', 'Cordia dichotoma', 15], ['Neem', 'Azadirachta indica', 14.3],
+  ['Moringa', 'Moringa oleifera', 12.2], ['Cassia', 'Cassia javanica', 12],
+  ['Guava', 'Psidium guajava', 10], ['Sindoor', 'Bixa orellana', 10],
+  ['Tecoma', 'Tecoma stans', 6],
+].map(([name, scientific, co2PerYear]) => ({ id: null, name, scientific, co2PerYear, isDefault: true }))
+
+const speciesRow = (r) => ({
+  id:         r.id,
+  name:       r.name,
+  scientific: r.scientific_name || '',
+  co2PerYear: Number(r.co2_per_year),
+  isDefault:  !!r.is_default,
+})
+
+// GET /api/partner/species — the full list, highest CO₂ first.
+router.get('/species', requirePartner, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('tree_species')
+      .select('id, name, scientific_name, co2_per_year, is_default')
+      .order('co2_per_year', { ascending: false })
+    if (error) {
+      console.warn('[partner/species] tree_species missing — run TreeApp/supabase/migrations/006_tree_species.sql:', error.message)
+      return res.json({ species: DEFAULT_TREE_SPECIES, persisted: false })
+    }
+    res.json({ species: (data || []).map(speciesRow), persisted: true })
+  } catch (err) {
+    console.error('[partner/species GET]', err)
+    res.status(500).json({ error: 'Failed to load species' })
+  }
+})
+
+// POST /api/partner/species — add a species that is not in the list yet.
+router.post('/species', requirePartner, async (req, res) => {
+  try {
+    const name       = String(req.body?.name || '').trim()
+    const scientific = String(req.body?.scientific || '').trim()
+    const co2        = Number(req.body?.co2PerYear)
+    if (!name) return res.status(400).json({ error: 'Common name is required' })
+    if (!Number.isFinite(co2) || co2 < 0) return res.status(400).json({ error: 'CO₂ kg/year must be a number' })
+
+    const { data, error } = await supabase
+      .from('tree_species')
+      .insert({ name, scientific_name: scientific || null, co2_per_year: co2, created_by: req.userId })
+      .select('id, name, scientific_name, co2_per_year, is_default')
+      .single()
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'This species is already in the list' })
+      if (error.code === '42P01') return res.status(503).json({ error: 'Species table not set up yet — run migration 006_tree_species.sql' })
+      throw error
+    }
+    res.status(201).json({ species: speciesRow(data) })
+  } catch (err) {
+    console.error('[partner/species POST]', err)
+    res.status(500).json({ error: err.message || 'Failed to add species' })
+  }
+})
+
+// Tree lifecycle stages the partner can set (Assign action form / edit).
+const TREE_STAGES = ['Under plantation', 'Planted', 'Growing', 'Established', 'Needs care', 'Dead']
+
+// `stage`, `team_member_id` and `assigned_to` come from migration 005_tree_stage.sql.
+// Until it has been run, keep everything working without them instead of
+// failing every request.
+const columnChecks = {}
+function hasTreeColumn(col) {
+  if (!columnChecks[col]) {
+    columnChecks[col] = supabase.from('tree_records').select(col).limit(1)
+      .then(({ error }) => {
+        if (error) {
+          console.warn(`[partner/trees] tree_records.${col} missing — run TreeApp/supabase/migrations/005_tree_stage.sql`)
+          delete columnChecks[col] // look again next time, the migration may have been run since
+          return false
+        }
+        return true
+      })
+  }
+  return columnChecks[col]
+}
+const hasStageColumn    = () => hasTreeColumn('stage')
+const hasAssignedColumn = () => hasTreeColumn('assigned_to')
+
+// Who the tree was recorded for, kept on the row itself (see migration 005).
+async function assignmentFields(member) {
+  if (!member || !(await hasAssignedColumn())) return {}
+  return {
+    team_member_id: member.id,
+    assigned_to:    member.name || member.email || null,
+  }
+}
+
+// Human-readable ID, same "TREE-" style the field app uses.
+function newTreeCode() {
+  const rand = Math.random().toString(36).slice(2, 5)
+  return `TREE-${Date.now().toString(36).slice(-4)}${rand}`.toUpperCase()
+}
+
 // ── GET /api/partner/trees — list, for the partner's own people/projects ────
 router.get('/trees', requirePartner, async (req, res) => {
   try {
@@ -1430,9 +1733,12 @@ router.get('/trees', requirePartner, async (req, res) => {
     const { projectIds } = await partnerScope(req.userId)
     if (projectIds.length === 0) return res.json({ trees: [] })
 
+    const [withStage, withAssigned] = await Promise.all([hasStageColumn(), hasAssignedColumn()])
     let query = supabase
       .from('tree_records')
-      .select('id, species, scientific_name, quantity, event_type, health_status, tree_condition, latitude, longitude, photo_url, notes, project_id, user_id, surveyor, submitted_at')
+      .select('id, tree_id, species, scientific_name, quantity, event_type, health_status, tree_condition, latitude, longitude, photo_url, notes, project_id, user_id, surveyor, submitted_at, survey_date'
+        + (withStage ? ', stage' : '')
+        + (withAssigned ? ', assigned_to, team_member_id' : ''))
       .in('user_id', userIds)
       .in('project_id', projectIds)
       .order('submitted_at', { ascending: false })
@@ -1463,6 +1769,8 @@ router.get('/trees', requirePartner, async (req, res) => {
     res.json({
       trees: (data || []).map(t => ({
         id:              t.id,
+        treeCode:        t.tree_id || `TREE-${String(t.id).slice(0, 8).toUpperCase()}`,
+        stage:           t.stage || 'Under plantation',
         species:         t.species,
         scientificName:  t.scientific_name,
         quantity:        t.quantity || 1,
@@ -1476,9 +1784,11 @@ router.get('/trees', requirePartner, async (req, res) => {
         projectId:       t.project_id,
         projectName:     projectMap[t.project_id] || t.project_id,
         userId:          t.user_id,
-        recordedFor:     nameMap[t.user_id] || '—',
+        recordedFor:     t.assigned_to || nameMap[t.user_id] || '—',
+        teamMemberId:    t.team_member_id || null,
         surveyor:        t.surveyor,
         submittedAt:     t.submitted_at,
+        surveyDate:      t.survey_date,
         taskStatus:      taskMap[t.id]?.status || null,
         taskId:          taskMap[t.id]?.id || null,
       })),
@@ -1532,7 +1842,7 @@ router.get('/trees/:id', requirePartner, async (req, res) => {
 // (P6-04): a correction is a new record, never a silent rewrite of identity.
 const TREE_EDITABLE_FIELDS = [
   'species', 'scientific_name', 'quantity', 'event_type', 'health_status',
-  'tree_condition', 'land_type', 'dbh_cm', 'height_m', 'notes',
+  'tree_condition', 'land_type', 'dbh_cm', 'height_m', 'notes', 'survey_date',
 ]
 
 router.patch('/trees/:id', requirePartner, async (req, res) => {
@@ -1564,6 +1874,10 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
       if (req.body[field] === undefined) continue
       const val = req.body[field]
       updates[field] = (val === '' ? null : val)
+    }
+    if (req.body.stage !== undefined) {
+      if (!TREE_STAGES.includes(req.body.stage)) return res.status(400).json({ error: 'Unknown stage' })
+      if (await hasStageColumn()) updates.stage = req.body.stage
     }
     if (updates.species === null) return res.status(400).json({ error: 'Species cannot be empty' })
     if (updates.quantity !== undefined) {
@@ -1732,6 +2046,7 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
       latitude,
       longitude,
       species,
+      tree_id:      newTreeCode(),
       photo_url:    photoUrl,
       health_status: b.health_status || 'healthy',
       event_type:   b.event_type || 'Planting',
@@ -1755,11 +2070,15 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
     const payload = Object.fromEntries(
       Object.entries(record).filter(([, v]) => v !== null && v !== undefined && v !== '')
     )
+    if (await hasStageColumn()) {
+      payload.stage = TREE_STAGES.includes(b.stage) ? b.stage : 'Under plantation'
+    }
+    Object.assign(payload, await assignmentFields(member))
 
     const { data, error } = await supabase
       .from('tree_records')
       .insert(payload)
-      .select('id, species, quantity, project_id, user_id')
+      .select('id, tree_id, species, quantity, project_id, user_id')
       .single()
 
     if (error) throw error
@@ -1776,7 +2095,7 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
     res.status(201).json({
       tree: data,
       recordedFor: member.name || member.email,
-      message: `Tree recorded for ${member.name || member.email}`,
+      message: `Tree ${data.tree_id || ''} recorded for ${member.name || member.email}`.replace('  ', ' '),
       tasksCreated: tasksCreated.length,
       task: tasksCreated[0] || null,
     })
@@ -1901,6 +2220,7 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
     const now      = new Date().toISOString()
     const today    = now.slice(0, 10)
 
+    const assignment = await assignmentFields(member)
     const payload = parsed.rows.map(r => {
       const record = {
         user_id:        resolvedImportUserId,
@@ -1921,6 +2241,8 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
         survey_date:    today,
         submitted_at:   now,
         synced:         true,
+        tree_id:        newTreeCode(),
+        ...assignment,
       }
       // Several columns are NOT NULL with a default, so an explicit null is
       // rejected where omitting the key is fine.
