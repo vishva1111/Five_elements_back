@@ -824,17 +824,18 @@ router.get('/team', requirePartner, async (req, res) => {
     const members = (data || []).map(m => {
       const authId = m.user_id || byEmail[String(m.email || '').toLowerCase()] || null
       return {
-        id:        m.id,
-        name:      m.name,
-        email:     m.email,
-        role:      m.role,
-        roleLabel: TEAM_ROLE_TO_PLATFORM_ROLE[m.role]?.label || m.role,
-        status:    m.status,
-        joinedAt:  m.joined_at ? new Date(m.joined_at).toLocaleDateString('en-IN') : '—',
+        id:           m.id,
+        name:         m.name,
+        email:        m.email,
+        role:         m.role,
+        roleLabel:    TEAM_ROLE_TO_PLATFORM_ROLE[m.role]?.label || m.role,
+        status:       m.status,
+        joinedAt:     m.joined_at ? new Date(m.joined_at).toLocaleDateString('en-IN') : '—',
         authId,
-        canRecord: !!authId,
-        projectId:   m.project_id || null,
-        projectName: m.project_id ? (projectNameMap[m.project_id] || m.project_id) : null,
+        canRecord:    !!authId,
+        projectId:    m.project_id || null,
+        projectName:  m.project_id ? (projectNameMap[m.project_id] || m.project_id) : null,
+        tempPassword: m.temp_password || null,
       }
     })
 
@@ -849,7 +850,7 @@ router.get('/team', requirePartner, async (req, res) => {
 router.post('/team/invite', requirePartner, async (req, res) => {
   try {
     const userId = req.userId
-    const { email: rawEmail, role, name, project_id: projectId, password: chosenPassword } = req.body
+    const { email: rawEmail, role, name, project_id: singleProjectId, project_ids: rawProjectIds, password: chosenPassword } = req.body
 
     if (!rawEmail || !role) return res.status(400).json({ error: 'email and role are required' })
     if (!TEAM_ROLE_TO_PLATFORM_ROLE[role]) {
@@ -866,13 +867,25 @@ router.post('/team/invite', requirePartner, async (req, res) => {
     // flow is Project Active -> Create Users, not "join the org generally" —
     // so a project is compulsory for them. Org-role members (admin/field
     // officer/viewer) work across the org and don't pick one.
+    // project_ids (array) takes precedence over legacy project_id (string).
     const isPlatformUser = ['business', 'individual'].includes(role)
+    // Normalise to an array of project IDs
+    let projectIds_req = []
+    if (Array.isArray(rawProjectIds) && rawProjectIds.length > 0) {
+      projectIds_req = rawProjectIds.filter(Boolean)
+    } else if (singleProjectId) {
+      projectIds_req = [singleProjectId]
+    }
+    // For backward compat keep a single projectId reference (first in list)
+    const projectId = projectIds_req[0] || null
+
     let project = null
     if (isPlatformUser) {
-      if (!projectId) return res.status(400).json({ error: 'Choose a project for this user' })
-      const { projectIds } = await partnerScope(userId)
-      if (!projectIds.includes(projectId)) {
-        return res.status(403).json({ error: 'That project is not one of your approved projects' })
+      if (projectIds_req.length === 0) return res.status(400).json({ error: 'Choose at least one project for this user' })
+      const { projectIds: allowedIds } = await partnerScope(userId)
+      const forbidden = projectIds_req.filter(id => !allowedIds.includes(id))
+      if (forbidden.length > 0) {
+        return res.status(403).json({ error: 'One or more projects are not in your approved projects' })
       }
       const { data: proj } = await supabase.from('projects').select('id, name').eq('id', projectId).maybeSingle()
       project = proj
@@ -972,34 +985,41 @@ router.post('/team/invite', requirePartner, async (req, res) => {
       }
     }
 
-    // ── 3. The team row. ────────────────────────────────────────────────────
-    const memberRow = {
-      partner_id: profile.id,
-      name:       displayName,
+    // ── 3. The team row(s). ─────────────────────────────────────────────────
+    // For platform users with multiple projects, insert one row per project.
+    // For org-role members (admin/field officer/viewer), insert a single row.
+    const baseRow = {
+      partner_id:    profile.id,
+      name:          displayName,
       email,
       role,
-      status:     tempPassword ? 'invited' : 'active',
-      joined_at:  new Date().toISOString(),
-      ...(isPlatformUser ? { project_id: projectId } : {}),
+      status:        tempPassword ? 'invited' : 'active',
+      joined_at:     new Date().toISOString(),
+      ...(tempPassword ? { temp_password: tempPassword } : {}),
     }
+
+    const rowsToInsert = isPlatformUser && projectIds_req.length > 1
+      ? projectIds_req.map(pid => ({ ...baseRow, project_id: pid }))
+      : [{ ...baseRow, ...(isPlatformUser ? { project_id: projectId } : {}) }]
 
     // user_id arrives with migration 003, project_id with migration 004. Try
     // the fully-linked insert first and fall back column-by-column if either
     // is missing, so Team invites keep working on an older DB — but a User
     // needs project_id to mean anything, so its absence has to be a clear
     // error, not a silent drop of a field the whole feature depends on.
+    const rowsWithUserId = rowsToInsert.map(r => ({ ...r, user_id: authUser.id }))
     let { data, error } = await supabase
       .from('partner_team_members')
-      .insert({ ...memberRow, user_id: authUser.id })
+      .insert(rowsWithUserId.length === 1 ? rowsWithUserId[0] : rowsWithUserId)
       .select('id')
-      .single()
+      .maybeSingle()
 
     if (error && /user_id/.test(String(error.message || ''))) {
       ({ data, error } = await supabase
         .from('partner_team_members')
-        .insert(memberRow)
+        .insert(rowsToInsert.length === 1 ? rowsToInsert[0] : rowsToInsert)
         .select('id')
-        .single())
+        .maybeSingle())
     }
 
     // The team row is what actually links the auth account to this partner.
@@ -1076,10 +1096,13 @@ router.post('/team/invite', requirePartner, async (req, res) => {
 router.patch('/team/:id', requirePartner, async (req, res) => {
   try {
     const { id } = req.params
-    const { status, role, name, project_id: projectId } = req.body
+    const { status, role, name, project_id: projectId, password } = req.body
 
-    if (status === undefined && role === undefined && name === undefined) {
+    if (status === undefined && role === undefined && name === undefined && password === undefined) {
       return res.status(400).json({ error: 'Nothing to update' })
+    }
+    if (password !== undefined && String(password).length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters.' })
     }
     if (status !== undefined && !['active', 'invited', 'inactive'].includes(status)) {
       return res.status(400).json({ error: 'status must be active, invited or inactive' })
@@ -1181,6 +1204,26 @@ router.patch('/team/:id', requirePartner, async (req, res) => {
           .update({ display_name: String(name).trim() })
           .eq('auth_id', authId)
       }
+    }
+
+    // Password reset — only possible if the member has a linked auth account.
+    if (password !== undefined && String(password).trim()) {
+      const authId = await resolveMemberAuthId(member)
+      if (!authId) {
+        return res.status(400).json({ error: 'No sign-in account found for this member — cannot change password.' })
+      }
+      const { error: pwErr } = await supabase.auth.admin.updateUserById(authId, {
+        password: String(password),
+      })
+      if (pwErr) {
+        return res.status(400).json({ error: `Password update failed: ${pwErr.message}` })
+      }
+      // Store the new password so the partner can see it in the edit modal next time.
+      await supabase
+        .from('partner_team_members')
+        .update({ temp_password: String(password) })
+        .eq('id', id)
+        .eq('partner_id', profile.id)
     }
 
     res.json({ success: true, warning: accessWarning })
@@ -1350,7 +1393,14 @@ router.get('/team-users', requirePartner, async (req, res) => {
       }))
       // Someone with no account cannot own a record; surface them as unusable
       // rather than hiding them, so the partner understands why.
-      .map(u => ({ ...u, canRecord: !!u.authId }))
+      // If no real auth account exists, we still allow the partner to record
+      // work for this member — the tree record will be owned by the partner's
+      // own auth ID and the member is identified by a "member:<id>" sentinel.
+      .map(u => ({
+        ...u,
+        canRecord: true,
+        effectiveId: u.authId || `member:${u.teamMemberId}`,
+      }))
 
     res.json({ users, orgName: profile.org_name })
   } catch (err) {
@@ -1372,8 +1422,10 @@ router.get('/team-users', requirePartner, async (req, res) => {
 // ── GET /api/partner/trees — list, for the partner's own people/projects ────
 router.get('/trees', requirePartner, async (req, res) => {
   try {
-    const { userIds } = await partnerOwnedUserIds(req.userId)
-    if (userIds.length === 0) return res.json({ trees: [] })
+    const { userIds: ownedIds } = await partnerOwnedUserIds(req.userId)
+    // Always include the partner's own auth ID so records they entered directly
+    // (e.g. seeded data or records added via the partner account) are visible.
+    const userIds = [...new Set([...ownedIds, req.userId])]
 
     const { projectIds } = await partnerScope(req.userId)
     if (projectIds.length === 0) return res.json({ trees: [] })
@@ -1622,16 +1674,24 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
       .eq('partner_id', profile.id)
       .neq('status', 'inactive')
 
-    let member = (members || []).find(m => m.user_id === onBehalfOf)
-    if (!member) {
-      const listed = await listAllAuthUsers()
-      const authUser = (listed?.users || []).find(u => u.id === onBehalfOf)
-      const email = String(authUser?.email || '').toLowerCase()
-      member = (members || []).find(m => String(m.email || '').toLowerCase() === email)
-    }
-
-    if (!member) {
-      return res.status(403).json({ error: 'That user is not on your team' })
+    // Support "member:<teamMemberId>" sentinel for members without auth accounts.
+    let resolvedUserId = onBehalfOf
+    let member
+    if (String(onBehalfOf).startsWith('member:')) {
+      const memberId = String(onBehalfOf).replace('member:', '')
+      member = (members || []).find(m => String(m.id) === memberId)
+      if (!member) return res.status(403).json({ error: 'That user is not on your team' })
+      // Record is owned by the partner themselves when the member has no auth account.
+      resolvedUserId = partnerUserId
+    } else {
+      member = (members || []).find(m => m.user_id === onBehalfOf)
+      if (!member) {
+        const listed = await listAllAuthUsers()
+        const authUser = (listed?.users || []).find(u => u.id === onBehalfOf)
+        const email = String(authUser?.email || '').toLowerCase()
+        member = (members || []).find(m => String(m.email || '').toLowerCase() === email)
+      }
+      if (!member) return res.status(403).json({ error: 'That user is not on your team' })
     }
 
     // The project must be one of this partner's approved projects.
@@ -1644,7 +1704,7 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
     let photoUrl = null
     if (req.file) {
       const ext  = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase()
-      const path = `${onBehalfOf}/${Date.now()}.${ext}`
+      const path = `${resolvedUserId}/${Date.now()}.${ext}`
       const { error: upErr } = await supabase.storage
         .from('tree-photos')
         .upload(path, req.file.buffer, { contentType: req.file.mimetype, upsert: false })
@@ -1667,7 +1727,7 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
     }
 
     const record = {
-      user_id:      onBehalfOf,
+      user_id:      resolvedUserId,
       project_id:   projectId,
       latitude,
       longitude,
@@ -1768,14 +1828,24 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
       .eq('partner_id', profile.id)
       .neq('status', 'inactive')
 
-    let member = (members || []).find(m => m.user_id === onBehalfOf)
-    if (!member) {
-      const listed = await listAllAuthUsers()
-      const authUser = (listed?.users || []).find(u => u.id === onBehalfOf)
-      const email = String(authUser?.email || '').toLowerCase()
-      member = (members || []).find(m => String(m.email || '').toLowerCase() === email)
+    // Support "member:<teamMemberId>" sentinel for members without auth accounts.
+    let resolvedImportUserId = onBehalfOf
+    let member
+    if (String(onBehalfOf).startsWith('member:')) {
+      const memberId = String(onBehalfOf).replace('member:', '')
+      member = (members || []).find(m => String(m.id) === memberId)
+      if (!member) return res.status(403).json({ error: 'That user is not on your team' })
+      resolvedImportUserId = partnerUserId
+    } else {
+      member = (members || []).find(m => m.user_id === onBehalfOf)
+      if (!member) {
+        const listed = await listAllAuthUsers()
+        const authUser = (listed?.users || []).find(u => u.id === onBehalfOf)
+        const email = String(authUser?.email || '').toLowerCase()
+        member = (members || []).find(m => String(m.email || '').toLowerCase() === email)
+      }
+      if (!member) return res.status(403).json({ error: 'That user is not on your team' })
     }
-    if (!member) return res.status(403).json({ error: 'That user is not on your team' })
 
     const { projectIds } = await partnerScope(partnerUserId)
     if (!projectIds.includes(projectId)) {
@@ -1833,7 +1903,7 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
 
     const payload = parsed.rows.map(r => {
       const record = {
-        user_id:        onBehalfOf,
+        user_id:        resolvedImportUserId,
         project_id:     projectId,
         latitude:       r.latitude,
         longitude:      r.longitude,
