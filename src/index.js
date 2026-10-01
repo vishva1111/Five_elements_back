@@ -18,6 +18,7 @@ const certificateRouter   = require('./routes/certificate')
 const submitProjectRouter = require('./routes/submitProject')
 const partnerRouter       = require('./routes/partner')
 const adminRouter         = require('./routes/admin')
+
 const notificationsRouter = require('./routes/notifications')
 const { requireAuth }     = require('./middleware/auth')
 

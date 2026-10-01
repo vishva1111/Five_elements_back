@@ -207,6 +207,61 @@ function generateTempPassword() {
   return `Fe${rand}9!`
 }
 
+/**
+ * A project a partner just had approved shouldn't open with zero Users under
+ * it — this mints one automatically, in the same shape a partner gets by
+ * hand from Team > + New user (a real, usable account: generated email,
+ * generated password, role individual, locked to this project). The partner
+ * can rename it to a real person later from Team; nothing here assumes it
+ * stays a placeholder.
+ */
+async function createDefaultProjectUser({ partnerId, projectSlug, projectTitle }) {
+  const email    = `project-${projectSlug}@fiveelements.internal`
+  const password = generateTempPassword()
+  const name     = projectTitle ? `${projectTitle} — Default User` : 'Project Default User'
+
+  const { data: created, error: createErr } = await supabase.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+    user_metadata: { display_name: name },
+  })
+  if (createErr) throw new Error(`Could not create default user: ${createErr.message}`)
+
+  const authId = created.user.id
+
+  const { error: profileErr } = await supabase.from('profiles').insert({
+    id:             `ind-${authId.slice(0, 8)}`,
+    auth_id:        authId,
+    display_name:   name,
+    name,
+    type:           'Individual',   // profiles_type_check allows only Individual | Business
+    location:       '',
+    avatar:         '',
+    trees:          0,
+    t_co2e:         0,
+    role:           'individual',
+    roles:          ['individual'],
+    status:         'active',
+    is_first_login: true,
+  })
+  if (profileErr) throw new Error(`Default user account created but profile insert failed: ${profileErr.message}`)
+
+  const { error: memberErr } = await supabase.from('partner_team_members').insert({
+    partner_id: partnerId,
+    name,
+    email,
+    role:       'individual',
+    status:     'active',
+    joined_at:  new Date().toISOString(),
+    user_id:    authId,
+    project_id: projectSlug,
+  })
+  if (memberErr) throw new Error(`Default user account created but could not be added to the team: ${memberErr.message}`)
+
+  return { email, tempPassword: password, name, authId }
+}
+
 // ─── Auth guards ──────────────────────────────────────────────────────────────
 // Both run only behind app.use('/api/admin', requireAuth, adminRouter)
 // (index.js) — requireAuth has already verified the JWT and resolved req.role
@@ -237,6 +292,7 @@ module.exports = {
   DEFAULT_TCO2E_PER_TREE,
   publishCaptureToLedger,
   generateTempPassword,
+  createDefaultProjectUser,
   requireAdmin,
   requireAdminOrPartner,
 }

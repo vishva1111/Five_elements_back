@@ -14,6 +14,7 @@ const {
   DEFAULT_TCO2E_PER_TREE,
   publishCaptureToLedger,
   generateTempPassword,
+  createDefaultProjectUser,
   requireAdmin,
   requireAdminOrPartner,
 } = require('../services/adminHelpers')
@@ -29,15 +30,15 @@ router.get('/queue', requireAdmin, async (req, res) => {
     const [{ data: evidence }, { data: projects }, { data: partners }] = await Promise.all([
       supabase
         .from('evidence_files')
-        .select('id, submission_id, created_at, project_submissions(project_id, submitted_by, projects(title, element))')
+        .select('id, submission_id, uploaded_at, project_submissions(project_id, submitted_by, title, element)')
         .eq('status', 'pending_review')
-        .order('created_at', { ascending: true })
+        .order('uploaded_at', { ascending: true })
         .limit(50),
       supabase
         .from('project_submissions')
-        .select('id, submitted_by, created_at, projects(title, element)')
+        .select('id, submitted_by, submitted_at, title, element, project_id')
         .eq('status', 'pending_review')
-        .order('created_at', { ascending: true })
+        .order('submitted_at', { ascending: true })
         .limit(50),
       supabase
         .from('partner_profiles')
@@ -53,10 +54,10 @@ router.get('/queue', requireAdmin, async (req, res) => {
         items.push({
           id:          e.id,
           type:        'evidence',
-          title:       sub?.projects?.title || 'Evidence submission',
+          title:       sub?.title || 'Evidence submission',
           submittedBy: sub?.submitted_by || '—',
-          submittedAt: new Date(e.created_at).toLocaleDateString('en-GB'),
-          element:     sub?.projects?.element || '',
+          submittedAt: e.uploaded_at ? new Date(e.uploaded_at).toLocaleDateString('en-GB') : '—',
+          element:     sub?.element || '',
           priority:    'normal',
         })
       })
@@ -67,10 +68,10 @@ router.get('/queue', requireAdmin, async (req, res) => {
         items.push({
           id:          p.id,
           type:        'project',
-          title:       p.projects?.title || 'Project submission',
+          title:       p.title || 'Project submission',
           submittedBy: p.submitted_by || '—',
-          submittedAt: new Date(p.created_at).toLocaleDateString('en-GB'),
-          element:     p.projects?.element || '',
+          submittedAt: p.submitted_at ? new Date(p.submitted_at).toLocaleDateString('en-GB') : '—',
+          element:     p.element || '',
           priority:    'normal',
         })
       })
@@ -585,6 +586,7 @@ router.patch('/submissions/:id/review', requireAdmin, async (req, res) => {
     // projects never reached the marketplace, the partner portal or the field app.
     let createdProjectId = null
     let projectWarning   = null
+    let defaultUser       = null
 
     if (action === 'approve' && !sub.project_id) {
       try {
@@ -593,10 +595,12 @@ router.patch('/submissions/:id/review', requireAdmin, async (req, res) => {
         // projects.partner is the public "delivered by" label and is NOT NULL.
         // Most submissions come from a partner org; the rest (an individual or
         // business submitting their own project) fall back to the submitter's
-        // display name, so approval never fails for want of a label.
+        // display name, so approval never fails for want of a label. The same
+        // lookup also tells us below whether this project belongs to a partner
+        // org at all — only those get an auto-created default User.
         const { data: partnerProfile } = await supabase
           .from('partner_profiles')
-          .select('org_name')
+          .select('id, org_name')
           .eq('user_id', sub.submitted_by)
           .maybeSingle()
 
@@ -640,6 +644,23 @@ router.patch('/submissions/:id/review', requireAdmin, async (req, res) => {
 
         createdProjectId    = slug
         updatePayload.project_id = slug
+
+        // A project that belongs to a partner org never opens with zero
+        // Users under it — mint one automatically. Self-submitted projects
+        // (no partner_profiles row for the submitter) have no team to add
+        // one to, so this only runs for genuine partner projects.
+        if (partnerProfile) {
+          try {
+            defaultUser = await createDefaultProjectUser({
+              partnerId:    partnerProfile.id,
+              projectSlug:  slug,
+              projectTitle: sub.title,
+            })
+          } catch (e) {
+            console.error('[admin/submissions review] default user creation failed:', e.message)
+            projectWarning = `Project approved, but the default user could not be created: ${e.message}`
+          }
+        }
       } catch (e) {
         // Don't fail the review itself — record it and let the admin retry.
         projectWarning = `Submission approved, but the project record could not be created: ${e.message}`
@@ -684,11 +705,12 @@ router.patch('/submissions/:id/review', requireAdmin, async (req, res) => {
     }
 
     res.json({
-      success:   true,
-      status:    updatePayload.status,
-      outcome:   updatePayload.outcome || null,
-      projectId: createdProjectId,
-      warning:   projectWarning,
+      success:    true,
+      status:     updatePayload.status,
+      outcome:    updatePayload.outcome || null,
+      projectId:  createdProjectId,
+      warning:    projectWarning,
+      defaultUser,
     })
   } catch (err) {
     res.status(500).json({ error: err.message })
