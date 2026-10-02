@@ -18,6 +18,7 @@ const {
   requireAdmin,
   requireAdminOrPartner,
 } = require('../services/adminHelpers')
+const { partnerScope } = require('../services/partnerHelpers')
 
 // ─── A1: Approval queue ───────────────────────────────────────────────────────
 // GET /api/admin/queue
@@ -1085,6 +1086,13 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
     if (project_id)  query = query.eq('project_id', project_id)
     if (assignee_id) query = query.eq('assignee_id', assignee_id)
 
+    // A partner works on their own projects only — never another partner's tasks.
+    if (req.role === 'partner') {
+      const { projectIds } = await partnerScope(req.userId)
+      if (projectIds.length === 0) return res.json({ tasks: [] })
+      query = query.in('project_id', projectIds)
+    }
+
     const { data, error } = await query
     if (error) throw error
 
@@ -1104,7 +1112,7 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
         : Promise.resolve({ data: [] }),
       // The photo the field user captured lives on the linked tree record, not the task.
       treeIds.length > 0
-        ? supabase.from('tree_records').select('id, photo_url, species, health_status, submitted_at').in('id', treeIds)
+        ? supabase.from('tree_records').select('id, tree_id, photo_url, species, health_status, submitted_at').in('id', treeIds)
         : Promise.resolve({ data: [] }),
     ])
 
@@ -1123,6 +1131,8 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
         photo_url:     treeMap[t.tree_id]?.photo_url     || null,
         tree_species:  treeMap[t.tree_id]?.species       || null,
         tree_health:   treeMap[t.tree_id]?.health_status || null,
+        // Human-readable tree ID (TREE-…), same fallback the listing uses.
+        tree_code:     t.tree_id ? (treeMap[t.tree_id]?.tree_id || `TREE-${String(t.tree_id).slice(0, 8).toUpperCase()}`) : null,
       }))
     })
   } catch (err) {
@@ -1361,7 +1371,7 @@ router.post('/tasks/bulk-generate', requireAdminOrPartner, async (req, res) => {
 
     const { data: trees, error: treeErr } = await supabase
       .from('tree_records')
-      .select('id, species, latitude, longitude')
+      .select('id, tree_id, species, latitude, longitude')
       .eq('project_id', project_id)
     if (treeErr) throw treeErr
 
@@ -1378,7 +1388,7 @@ router.post('/tasks/bulk-generate', requireAdminOrPartner, async (req, res) => {
     for (const tree of toCreate) {
       const { data: codeData } = await supabase.rpc('generate_task_code', { p_tree_id: tree.id })
       const { error: insErr } = await supabase.from('tasks').insert({
-        name:         `Tree Survey — ${tree.species || 'Unknown species'} (${tree.id.slice(0, 8).toUpperCase()})`,
+        name:         `Tree Survey — ${tree.species || 'Unknown species'} (${tree.tree_id || tree.id.slice(0, 8).toUpperCase()})`,
         project_id,
         assignee_id,
         tree_id:      tree.id,
@@ -1455,7 +1465,7 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
         : Promise.resolve({ data: [] }),
       // The photo the field user captured lives on the linked tree record, not the task.
       treeIds.length > 0
-        ? supabase.from('tree_records').select('id, photo_url, species, health_status').in('id', treeIds)
+        ? supabase.from('tree_records').select('id, tree_id, photo_url, species, health_status').in('id', treeIds)
         : Promise.resolve({ data: [] }),
     ])
 
@@ -1474,6 +1484,8 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
         photo_url:     treeMap[t.tree_id]?.photo_url     || null,
         tree_species:  treeMap[t.tree_id]?.species       || null,
         tree_health:   treeMap[t.tree_id]?.health_status || null,
+        // Human-readable tree ID (TREE-…), same fallback the listing uses.
+        tree_code:     t.tree_id ? (treeMap[t.tree_id]?.tree_id || `TREE-${String(t.tree_id).slice(0, 8).toUpperCase()}`) : null,
       }))
     })
   } catch (err) {

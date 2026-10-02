@@ -412,6 +412,27 @@ router.get('/projects', requirePartner, async (req, res) => {
 
     const approvedAtMap = Object.fromEntries((subs || []).map(s => [s.project_id, s.submitted_at]))
 
+    // Trees recorded / planted in each project (one record = one tree; older
+    // records may carry a quantity). Paged — PostgREST caps a request at 1000 rows.
+    const recorded = {}
+    const planted  = {}
+    const pids = (projects || []).map(p => p.id)
+    const withStage = await hasStageColumn()
+    for (let from = 0; pids.length > 0; from += 1000) {
+      const { data: rows, error: rowsErr } = await supabase
+        .from('tree_records')
+        .select('project_id, quantity' + (withStage ? ', stage' : ''))
+        .in('project_id', pids)
+        .range(from, from + 999)
+      if (rowsErr) throw rowsErr
+      for (const r of rows || []) {
+        const q = Number(r.quantity) || 1
+        recorded[r.project_id] = (recorded[r.project_id] || 0) + q
+        if (withStage && r.stage && r.stage !== 'Under plantation') planted[r.project_id] = (planted[r.project_id] || 0) + q
+      }
+      if (!rows || rows.length < 1000) break
+    }
+
     const result = (projects || []).map(p => ({
       id:              p.id,
       name:            p.name,
@@ -421,6 +442,8 @@ router.get('/projects', requirePartner, async (req, res) => {
       description:     p.description,
       totalTrees:      p.total_trees,
       fundedTrees:     p.funded_trees,
+      treesRecorded:   recorded[p.id] || 0,
+      treesPlanted:    planted[p.id] || 0,
       progressPct:     p.total_trees > 0 ? Math.min(100, Math.round((p.funded_trees / p.total_trees) * 100)) : 0,
       tco2e:           p.tco2e,
       evidenceCount:   p.evidence_count,
@@ -965,7 +988,7 @@ router.post('/team/invite', requirePartner, async (req, res) => {
       const parsed = parseBusinessDetails(req.body, { required: true })
       if (parsed.error) return res.status(400).json({ error: parsed.error })
       if (!(await businessDetailsTableReady())) {
-        return res.status(400).json({ error: 'Business details need migration 007_business_details.sql to be run first.' })
+        return res.status(400).json({ error: 'Business details are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
       }
       business = parsed.value
     }
@@ -1192,7 +1215,7 @@ router.put('/team/:id/business', requirePartner, async (req, res) => {
       .from('business_details')
       .upsert({ partner_id: profile.id, email: String(member.email).toLowerCase(), ...parsed.value, updated_at: new Date().toISOString() }, { onConflict: 'partner_id,email' })
     if (error) {
-      if (error.code === '42P01') return res.status(400).json({ error: 'Business details need migration 007_business_details.sql to be run first.' })
+      if (error.code === '42P01') return res.status(400).json({ error: 'Business details are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
       throw error
     }
     res.json({ success: true })
@@ -1224,7 +1247,7 @@ router.post('/team/:id/documents', requirePartner, (req, res, next) => {
       .eq('email', email)
       .maybeSingle()
     if (readErr) {
-      if (readErr.code === '42P01') return res.status(400).json({ error: 'Business details need migration 007_business_details.sql to be run first.' })
+      if (readErr.code === '42P01') return res.status(400).json({ error: 'Business details are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
       throw readErr
     }
 
@@ -1647,7 +1670,7 @@ router.get('/species', requirePartner, async (req, res) => {
       .select('id, name, scientific_name, co2_per_year, is_default')
       .order('co2_per_year', { ascending: false })
     if (error) {
-      console.warn('[partner/species] tree_species missing — run TreeApp/supabase/migrations/006_tree_species.sql:', error.message)
+      console.warn('[partner/species] tree_species missing — run the setup SQL in Supabase:', error.message)
       return res.json({ species: DEFAULT_TREE_SPECIES, persisted: false })
     }
     res.json({ species: (data || []).map(speciesRow), persisted: true })
@@ -1673,7 +1696,7 @@ router.post('/species', requirePartner, async (req, res) => {
       .single()
     if (error) {
       if (error.code === '23505') return res.status(409).json({ error: 'This species is already in the list' })
-      if (error.code === '42P01') return res.status(503).json({ error: 'Species table not set up yet — run migration 006_tree_species.sql' })
+      if (error.code === '42P01') return res.status(503).json({ error: 'Species are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
       throw error
     }
     res.status(201).json({ species: speciesRow(data) })
@@ -1686,6 +1709,30 @@ router.post('/species', requirePartner, async (req, res) => {
 // Tree lifecycle stages the partner can set (Assign action form / edit).
 const TREE_STAGES = ['Under plantation', 'Planted', 'Growing', 'Established', 'Needs care', 'Dead']
 
+// Flow: Under plantation (no task) → Planted → a verification task appears in
+// Tasks → partner assigns a Field Operator → in progress → completed → partner
+// approves (ledger) or rejects (redo). Stages from Planted on need that check.
+const TASK_STAGES = ['Planted', 'Growing', 'Established', 'Needs care']
+
+/** Creates the verification task for a planted tree, unless it already has one. */
+async function ensureVerificationTask(treeId, partnerUserId) {
+  const { data: existingTask } = await supabase.from('tasks').select('id').eq('tree_id', treeId).maybeSingle()
+  if (existingTask) return null
+  const { data: tree } = await supabase
+    .from('tree_records')
+    .select('id, tree_id, species, latitude, longitude, project_id')
+    .eq('id', treeId)
+    .maybeSingle()
+  if (!tree) return null
+  const created = await autoCreateVerificationTasks({
+    trees: [{ id: tree.id, code: tree.tree_id, species: tree.species, latitude: tree.latitude, longitude: tree.longitude }],
+    projectId: tree.project_id,
+    partnerUserId,
+    anyOwner: true,
+  })
+  return created[0] || null
+}
+
 // `stage`, `team_member_id` and `assigned_to` come from migration 005_tree_stage.sql.
 // Until it has been run, keep everything working without them instead of
 // failing every request.
@@ -1695,7 +1742,7 @@ function hasTreeColumn(col) {
     columnChecks[col] = supabase.from('tree_records').select(col).limit(1)
       .then(({ error }) => {
         if (error) {
-          console.warn(`[partner/trees] tree_records.${col} missing — run TreeApp/supabase/migrations/005_tree_stage.sql`)
+          console.warn(`[partner/trees] tree_records.${col} missing — run the setup SQL in Supabase`)
           delete columnChecks[col] // look again next time, the migration may have been run since
           return false
         }
@@ -1717,10 +1764,19 @@ async function assignmentFields(member) {
 }
 
 // Human-readable ID, same "TREE-" style the field app uses.
+// Several are minted in one request (one per tree), so this is fully random:
+// 7 characters from 36 → ~78 billion combinations.
+const TREE_CODE_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 function newTreeCode() {
-  const rand = Math.random().toString(36).slice(2, 5)
-  return `TREE-${Date.now().toString(36).slice(-4)}${rand}`.toUpperCase()
+  const bytes = require('crypto').randomBytes(7)
+  let code = ''
+  for (const b of bytes) code += TREE_CODE_ALPHABET[b % 36]
+  return `TREE-${code}`
 }
+
+// One record per physical tree — each gets its own Tree ID and, once planted,
+// its own verification task. Capped so a typo can't create a runaway batch.
+const MAX_TREES_PER_ENTRY = 500
 
 // ── GET /api/partner/trees — list, for the partner's own people/projects ────
 router.get('/trees', requirePartner, async (req, res) => {
@@ -1760,7 +1816,7 @@ router.get('/trees', requirePartner, async (req, res) => {
         ? supabase.from('projects').select('id, name').in('id', uniqueProjectIds)
         : Promise.resolve({ data: [] }),
       // So the list can show "task pending" / "verified" without a second round trip per row.
-      supabase.from('tasks').select('id, tree_id, status').in('tree_id', (data || []).map(t => t.id)),
+      supabase.from('tasks').select('id, tree_id, status, assignee_id, created_by').in('tree_id', (data || []).map(t => t.id)),
     ])
     const nameMap    = Object.fromEntries((namesRes.data || []).map(p => [p.auth_id, p.display_name]))
     const projectMap = Object.fromEntries((projectsRes.data || []).map(p => [p.id, p.name]))
@@ -1791,6 +1847,8 @@ router.get('/trees', requirePartner, async (req, res) => {
         surveyDate:      t.survey_date,
         taskStatus:      taskMap[t.id]?.status || null,
         taskId:          taskMap[t.id]?.id || null,
+        // Auto-created tasks start on the partner as a placeholder until a Field Operator is picked.
+        taskNeedsAssignee: !!taskMap[t.id] && taskMap[t.id].status === 'assigned' && taskMap[t.id].assignee_id === taskMap[t.id].created_by,
       })),
     })
   } catch (err) {
@@ -1862,11 +1920,18 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
     // record should not be quietly rewritten after the fact.
     const { data: linkedTask } = await supabase
       .from('tasks')
-      .select('status')
+      .select('id, status')
       .eq('tree_id', existing.id)
       .maybeSingle()
     if (linkedTask?.status === 'approved') {
       return res.status(409).json({ error: 'This record has already been verified and is on the ledger — it can no longer be edited.' })
+    }
+    // Planting is one-way: once a tree has left "Under plantation" it never goes back.
+    if (req.body.stage === 'Under plantation' && (await hasStageColumn())) {
+      const { data: current } = await supabase.from('tree_records').select('stage').eq('id', existing.id).maybeSingle()
+      if (current?.stage && current.stage !== 'Under plantation') {
+        return res.status(409).json({ error: 'This tree is already planted — it cannot go back to "Under plantation".' })
+      }
     }
 
     const updates = {}
@@ -1877,7 +1942,10 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
     }
     if (req.body.stage !== undefined) {
       if (!TREE_STAGES.includes(req.body.stage)) return res.status(400).json({ error: 'Unknown stage' })
-      if (await hasStageColumn()) updates.stage = req.body.stage
+      if (!(await hasStageColumn())) {
+        return res.status(400).json({ error: 'Stages are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
+      }
+      updates.stage = req.body.stage
     }
     if (updates.species === null) return res.status(400).json({ error: 'Species cannot be empty' })
     if (updates.quantity !== undefined) {
@@ -1890,7 +1958,12 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
     const { error } = await supabase.from('tree_records').update(updates).eq('id', existing.id)
     if (error) throw error
 
-    res.json({ success: true })
+    let taskCreated = null
+    if (updates.stage && TASK_STAGES.includes(updates.stage)) {
+      taskCreated = await ensureVerificationTask(existing.id, req.userId)
+    }
+
+    res.json({ success: true, taskCreated })
   } catch (err) {
     console.error('[partner/trees/:id PATCH]', err)
     res.status(500).json({ error: 'Failed to update tree record' })
@@ -2050,7 +2123,7 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
       photo_url:    photoUrl,
       health_status: b.health_status || 'healthy',
       event_type:   b.event_type || 'Planting',
-      quantity:     num(b.quantity) || 1,
+      quantity:     1,
       notes:        b.notes ? String(b.notes).trim() : null,
       scientific_name: b.scientific_name ? String(b.scientific_name).trim() : null,
       dbh_cm:       num(b.dbh_cm),
@@ -2075,27 +2148,44 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
     }
     Object.assign(payload, await assignmentFields(member))
 
-    const { data, error } = await supabase
+    // "Quantity 5" means five trees: five records, five Tree IDs.
+    const count = Math.max(1, Math.floor(Number(b.quantity) || 1))
+    if (count > MAX_TREES_PER_ENTRY) {
+      return res.status(400).json({ error: `Add at most ${MAX_TREES_PER_ENTRY} trees at a time — use the spreadsheet import for more.` })
+    }
+    const rows = Array.from({ length: count }, () => ({ ...payload, tree_id: newTreeCode() }))
+
+    const { data: inserted, error } = await supabase
       .from('tree_records')
-      .insert(payload)
+      .insert(rows)
       .select('id, tree_id, species, quantity, project_id, user_id')
-      .single()
 
     if (error) throw error
+    const data = inserted[0]
 
     // Bridges Tree Data -> Automatic Task Creation -> Field Operator in the
     // Super Admin / Partner / Business-Individual-User flow.
-    const tasksCreated = await autoCreateVerificationTasks({
-      trees: [{ id: data.id, species: data.species, latitude, longitude }],
-      projectId,
-      partnerUserId,
-      ownerRole: member.role,
-    })
+    // With stages, the verification task appears once the tree is planted —
+    // not while it is still under plantation. Without the stage column, keep
+    // the original rule (Business/Individual owners get a task straight away).
+    const treesForTasks = inserted.map(t => ({ id: t.id, code: t.tree_id, species: t.species, latitude, longitude }))
+    const tasksCreated = payload.stage !== undefined
+      ? (TASK_STAGES.includes(payload.stage)
+          ? await autoCreateVerificationTasks({ trees: treesForTasks, projectId, partnerUserId, anyOwner: true })
+          : [])
+      : await autoCreateVerificationTasks({ trees: treesForTasks, projectId, partnerUserId, ownerRole: member.role })
 
+    const who = member.name || member.email
+    const codes = inserted.map(t => t.tree_id)
     res.status(201).json({
       tree: data,
-      recordedFor: member.name || member.email,
-      message: `Tree ${data.tree_id || ''} recorded for ${member.name || member.email}`.replace('  ', ' '),
+      trees: inserted,
+      treeCodes: codes,
+      count: inserted.length,
+      recordedFor: who,
+      message: inserted.length === 1
+        ? `Tree ${codes[0]} recorded for ${who}.`
+        : `${inserted.length} trees recorded for ${who} (${codes[0]} … ${codes[codes.length - 1]}).`,
       tasksCreated: tasksCreated.length,
       task: tasksCreated[0] || null,
     })
@@ -2198,6 +2288,12 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
       return res.status(400).json({ error: 'That file has a header row but no data rows.', summary })
     }
 
+    // Every tree becomes its own record — keep one import to a sane size.
+    const MAX_TREES_PER_IMPORT = 5000
+    if (summary.totalTrees > MAX_TREES_PER_IMPORT) {
+      return res.status(400).json({ error: `This file adds ${summary.totalTrees.toLocaleString('en-IN')} trees — import at most ${MAX_TREES_PER_IMPORT.toLocaleString('en-IN')} at a time.`, summary })
+    }
+
     if (dryRun) {
       return res.json({ dryRun: true, ok: parsed.errors.length === 0, summary })
     }
@@ -2221,7 +2317,9 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
     const today    = now.slice(0, 10)
 
     const assignment = await assignmentFields(member)
-    const payload = parsed.rows.map(r => {
+    // A row with quantity 5 becomes five records, each with its own Tree ID.
+    const expanded = parsed.rows.flatMap(r => Array.from({ length: Math.max(1, Math.floor(Number(r.quantity) || 1)) }, () => r))
+    const payload = expanded.map(r => {
       const record = {
         user_id:        resolvedImportUserId,
         project_id:     projectId,
@@ -2232,7 +2330,7 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
         health_status:  r.health_status,
         tree_condition: r.tree_condition,
         event_type:     r.event_type,
-        quantity:       r.quantity,
+        quantity:       1,
         land_type:      r.land_type,
         dbh_cm:         r.dbh_cm,
         height_m:       r.height_m,
@@ -2262,12 +2360,14 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
     // Postgres preserves row order for a multi-row INSERT ... RETURNING, and
     // parsed.rows/payload/data are all built from the same ordered array, so
     // pairing by index is safe here.
-    const tasksCreated = await autoCreateVerificationTasks({
+    // Imported rows start as "Under plantation" once stages exist, so their
+    // tasks appear when each tree is marked Planted.
+    const tasksCreated = (await hasStageColumn()) ? [] : await autoCreateVerificationTasks({
       trees: data.map((row, i) => ({
         id:        row.id,
-        species:   parsed.rows[i].species,
-        latitude:  parsed.rows[i].latitude,
-        longitude: parsed.rows[i].longitude,
+        species:   expanded[i].species,
+        latitude:  expanded[i].latitude,
+        longitude: expanded[i].longitude,
       })),
       projectId,
       partnerUserId,
@@ -2278,7 +2378,7 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
       imported:   data.length,
       totalTrees: summary.totalTrees,
       recordedFor: summary.recordedFor,
-      message: `${data.length} record(s) imported for ${summary.recordedFor}.`,
+      message: `${data.length} tree${data.length === 1 ? '' : 's'} imported for ${summary.recordedFor}, each with its own Tree ID.`,
       tasksCreated: tasksCreated.length,
     })
   } catch (err) {
