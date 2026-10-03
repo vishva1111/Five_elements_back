@@ -50,6 +50,7 @@ const { withSignedUrls, signEvidencePath, BUCKET: EVIDENCE_BUCKET } = require('.
 const { parseTreeSheet, templateCsv, MAX_ROWS } = require('../services/treeImport')
 const { parseDonorSheet, templateCsv: donorTemplateCsv } = require('../services/donorImport')
 const { recordFunding } = require('../services/funding')
+const { syncProjectStats } = require('../services/projectStats')
 const { listAllAuthUsers } = require('../services/authUsers')
 const {
   generateTempPassword,
@@ -236,7 +237,7 @@ router.get('/dashboard', requirePartner, async (req, res) => {
         : Promise.resolve({ data: [] }),
       // Delivered quantity — approved evidence only (P2-03, PG-05).
       projectIds.length
-        ? supabase.from('ledger_entries').select('project_id, trees_verified').in('project_id', projectIds)
+        ? supabase.from('ledger_entries').select('project_id, trees_verified').in('project_id', projectIds).is('superseded_by', null)
         : Promise.resolve({ data: [] }),
       // Field activity feed — who captured what, most recent first.
       projectIds.length
@@ -659,7 +660,7 @@ router.get('/funders', requirePartner, async (req, res) => {
         .order('funded_at', { ascending: false }),
       // Funded vs delivered vs outstanding — delivered counts approved evidence
       // only, the same rule every other surface uses (P8-02, PG-05).
-      supabase.from('ledger_entries').select('trees_verified').in('project_id', projectIds),
+      supabase.from('ledger_entries').select('trees_verified').in('project_id', projectIds).is('superseded_by', null),
     ])
 
     if (error) throw error
@@ -758,12 +759,7 @@ router.patch('/funders/:id', requirePartner, async (req, res) => {
     const { error } = await supabase.from('individual_fundings').update(updates).eq('id', existing.id)
     if (error) throw error
 
-    if (treeDelta !== 0) {
-      const { data: project } = await supabase.from('projects').select('funded_trees').eq('id', existing.project_id).maybeSingle()
-      await supabase.from('projects')
-        .update({ funded_trees: Math.max(0, (project?.funded_trees || 0) + treeDelta), updated_at: new Date().toISOString() })
-        .eq('id', existing.project_id)
-    }
+    if (treeDelta !== 0) await syncProjectStats([existing.project_id])
 
     res.json({ success: true })
   } catch (err) {
@@ -773,7 +769,7 @@ router.patch('/funders/:id', requirePartner, async (req, res) => {
 })
 
 // ── DELETE /api/partner/funders/:id — remove a wrongly-entered donation ─────
-// Reverses projects.funded_trees / funders_count. Deliberately does NOT touch
+// projects.funded_trees / funders_count are recomputed afterwards. Deliberately does NOT touch
 // the matching ledger_entries row: individual_fundings.ledger_entry_id is a
 // uuid column but ledger_entries.id is text ("ORD-..."), so the two were never
 // actually linkable at write time — and the ledger is the platform's public,
@@ -796,14 +792,7 @@ router.delete('/funders/:id', requirePartner, async (req, res) => {
     const { error } = await supabase.from('individual_fundings').delete().eq('id', existing.id)
     if (error) throw error
 
-    const { data: project } = await supabase.from('projects').select('funded_trees, funders_count').eq('id', existing.project_id).maybeSingle()
-    if (project) {
-      await supabase.from('projects').update({
-        funded_trees:  Math.max(0, (project.funded_trees || 0) - (existing.trees_funded || 0)),
-        funders_count: Math.max(0, (project.funders_count || 0) - 1),
-        updated_at:    new Date().toISOString(),
-      }).eq('id', existing.project_id)
-    }
+    await syncProjectStats([existing.project_id])
 
     res.json({ success: true })
   } catch (err) {
@@ -1842,6 +1831,9 @@ router.get('/trees', requirePartner, async (req, res) => {
         userId:          t.user_id,
         recordedFor:     t.assigned_to || nameMap[t.user_id] || '—',
         teamMemberId:    t.team_member_id || null,
+        // Older records (before assignments were stored) sit on the partner's own
+        // account with nobody named — those can still be given their real person.
+        canSetAssignee:  withAssigned && !t.assigned_to && t.user_id === req.userId,
         surveyor:        t.surveyor,
         submittedAt:     t.submitted_at,
         surveyDate:      t.survey_date,
@@ -1939,6 +1931,17 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
       if (req.body[field] === undefined) continue
       const val = req.body[field]
       updates[field] = (val === '' ? null : val)
+    }
+    if (req.body.team_member_id) {
+      if (!(await hasAssignedColumn())) return res.status(400).json({ error: 'Assignments are not set up in the database yet.' })
+      const { data: cur } = await supabase.from('tree_records').select('assigned_to, user_id').eq('id', existing.id).maybeSingle()
+      if (cur?.assigned_to || cur?.user_id !== req.userId) {
+        return res.status(409).json({ error: 'This tree already belongs to someone — the owner cannot be changed here.' })
+      }
+      const profile = await partnerProfileFor(req.userId)
+      const member = profile ? await memberInOrg(profile.id, req.body.team_member_id) : null
+      if (!member) return res.status(400).json({ error: 'That person is not on your team' })
+      Object.assign(updates, await assignmentFields(member))
     }
     if (req.body.stage !== undefined) {
       if (!TREE_STAGES.includes(req.body.stage)) return res.status(400).json({ error: 'Unknown stage' })

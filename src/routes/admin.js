@@ -19,6 +19,7 @@ const {
   requireAdminOrPartner,
 } = require('../services/adminHelpers')
 const { partnerScope } = require('../services/partnerHelpers')
+const { syncProjectStats, syncAllProjectStats } = require('../services/projectStats')
 
 // ─── A1: Approval queue ───────────────────────────────────────────────────────
 // GET /api/admin/queue
@@ -185,6 +186,7 @@ router.post('/evidence/:id/approve', requireAdmin, async (req, res) => {
 
     // Update evidence status
     await supabase.from('evidence_files').update({ status: 'approved' }).eq('id', id)
+    if (projectId) await syncProjectStats([projectId])
 
     // Update submission status
     await supabase
@@ -956,6 +958,7 @@ router.post('/ledger/:id/supersede', requireAdmin, async (req, res) => {
       .from('ledger_entries')
       .update({ superseded_by: newEntry.id })
       .eq('id', id)
+    if (orig.project_id) await syncProjectStats([orig.project_id])
 
     res.json({ success: true, newEntryId: newEntry.id })
   } catch (err) {
@@ -1068,6 +1071,32 @@ router.patch('/config/settings', requireAdmin, async (req, res) => {
 // ─── Task Management (Admin) ──────────────────────────────────────────────────
 
 // GET /api/admin/tasks — list all tasks with filters
+// ── Partner scope for tasks ──────────────────────────────────────────────────
+// Admins see every task; a partner only ever touches tasks on their own projects.
+async function taskInPartnerScope(req, res, next) {
+  if (req.role !== 'partner') return next()
+  try {
+    const { projectIds } = await partnerScope(req.userId)
+    let projectId = req.body?.project_id
+    if (req.params.id) {
+      const { data: task } = await supabase.from('tasks').select('project_id').eq('id', req.params.id).maybeSingle()
+      if (!task) return res.status(404).json({ error: 'Task not found' })
+      projectId = task.project_id
+      // Moving a task to another project must stay inside the partner's projects too.
+      if (req.body?.project_id && !projectIds.includes(req.body.project_id)) {
+        return res.status(403).json({ error: 'That project is not one of yours' })
+      }
+    }
+    if (!projectId || !projectIds.includes(projectId)) {
+      if (req.params.id) return res.status(404).json({ error: 'Task not found' })
+      return res.status(projectId ? 403 : 400).json({ error: projectId ? 'That project is not one of yours' : 'Choose one of your projects for this task' })
+    }
+    next()
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+}
+
 router.get('/tasks', requireAdminOrPartner, async (req, res) => {
   try {
     const { status, project_id, assignee_id } = req.query
@@ -1142,7 +1171,7 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
 
 // POST /api/admin/tasks — create a new task
 // Body: { name, project_id, assignee_id, tree_id?, target_count, location, priority, due_date }
-router.post('/tasks', requireAdminOrPartner, async (req, res) => {
+router.post('/tasks', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { name, project_id, assignee_id, tree_id, target_count, location, priority, due_date } = req.body
 
@@ -1220,7 +1249,7 @@ router.post('/tasks', requireAdminOrPartner, async (req, res) => {
 // PUT /api/admin/tasks/:id — update task (reassign, change priority, etc.)
 // Unlike POST /tasks, assignee_id here is NOT restricted to Admin/Partner — this is also
 // how a ticket gets handed off to the real TreeApp field/individual user who'll do the work.
-router.put('/tasks/:id', requireAdminOrPartner, async (req, res) => {
+router.put('/tasks/:id', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { id } = req.params
     const { name, project_id, assignee_id, target_count, location, priority, due_date, status } = req.body
@@ -1275,7 +1304,7 @@ router.put('/tasks/:id', requireAdminOrPartner, async (req, res) => {
 })
 
 // DELETE /api/admin/tasks/:id
-router.delete('/tasks/:id', requireAdminOrPartner, async (req, res) => {
+router.delete('/tasks/:id', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { id } = req.params
 
@@ -1349,7 +1378,7 @@ router.get('/tasks/assignable-users', requireAdminOrPartner, async (req, res) =>
 // POST /api/admin/tasks/bulk-generate — create one task per tree in a project.
 // Body: { project_id, assignee_id, priority? }
 // Skips trees that already have a task (safe to call repeatedly / incrementally).
-router.post('/tasks/bulk-generate', requireAdminOrPartner, async (req, res) => {
+router.post('/tasks/bulk-generate', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { project_id, assignee_id, priority } = req.body
     if (!project_id || !assignee_id) {
@@ -1447,6 +1476,11 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
       .limit(100)
 
     if (project_id) query = query.eq('project_id', project_id)
+    if (req.role === 'partner') {
+      const { projectIds } = await partnerScope(req.userId)
+      if (projectIds.length === 0) return res.json({ tasks: [] })
+      query = query.in('project_id', projectIds)
+    }
 
     const { data, error } = await query
     if (error) throw error
@@ -1494,7 +1528,7 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
 })
 
 // PUT /api/admin/tasks/:id/approve
-router.put('/tasks/:id/approve', requireAdminOrPartner, async (req, res) => {
+router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { id } = req.params
     const { review_notes } = req.body
@@ -1550,7 +1584,7 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, async (req, res) => {
 })
 
 // PUT /api/admin/tasks/:id/reject
-router.put('/tasks/:id/reject', requireAdminOrPartner, async (req, res) => {
+router.put('/tasks/:id/reject', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { id } = req.params
     const { review_notes } = req.body

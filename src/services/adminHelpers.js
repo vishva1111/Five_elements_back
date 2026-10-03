@@ -187,15 +187,11 @@ async function publishCaptureToLedger({ taskId, treeId, projectId, reviewerId, r
   // funders view all reflect delivered work.
   const { error: projErr } = await supabase
     .from('projects')
-    .update({
-      tco2e:              Number((Number(project.tco2e || 0) + co2e).toFixed(2)),
-      evidence_count:     Number(project.evidence_count || 0) + 1,
-      last_evidence_date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }),
-      has_ledger_entry:   true,
-    })
+    .update({ has_ledger_entry: true })
     .eq('id', project.id)
-
-  if (projErr) console.error('[publishCaptureToLedger] counter update failed:', projErr.message)
+  if (projErr) console.error('[publishCaptureToLedger] has_ledger_entry update failed:', projErr.message)
+  // tco2e / evidence_count / last_evidence_date are recomputed from the ledger.
+  await require('./projectStats').syncProjectStats([project.id])
 
   return { ok: true, entryId: entry.id, trees, co2e }
 }

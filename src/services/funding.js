@@ -13,6 +13,11 @@
  * actually charged on money already collected on paper.
  */
 const supabase = require('../supabaseClient')
+const { syncProjectStats } = require('./projectStats')
+
+// Estimated CO₂ a funded tree will absorb — same default fund.js has always used.
+// (projects.tco2e now holds verified CO₂ only, so it can't be the basis for this.)
+const FUNDED_TCO2E_PER_TREE = 0.017
 
 async function recordFunding({
   project,
@@ -24,10 +29,7 @@ async function recordFunding({
   verificationStatus = 'pending',
   amountPaid = null,
 }) {
-  const tCO2ePerTree = project.tco2e && project.total_trees > 0
-    ? Number(project.tco2e) / project.total_trees
-    : 0.017   // default estimate, matching fund.js
-  const tCO2e = Number((trees * tCO2ePerTree).toFixed(4))
+  const tCO2e = Number((trees * FUNDED_TCO2E_PER_TREE).toFixed(4))
 
   const orderId = `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`
   const at = fundedAt ? new Date(fundedAt) : new Date()
@@ -48,23 +50,6 @@ async function recordFunding({
     })
 
   if (insertErr) throw new Error(`Failed to record funding: ${insertErr.message}`)
-
-  // Atomic SQL increment where the RPC exists; a non-atomic fallback otherwise.
-  const { error: updateErr } = await supabase.rpc('increment_project_funding', {
-    p_project_id:  project.id,
-    p_trees_delta: trees,
-  })
-  if (updateErr) {
-    console.warn('[recordFunding] RPC increment_project_funding not found, falling back:', updateErr.message)
-    await supabase
-      .from('projects')
-      .update({
-        funded_trees:  (project.funded_trees || 0) + trees,
-        funders_count: (project.funders_count || 0) + 1,
-        updated_at:    new Date().toISOString(),
-      })
-      .eq('id', project.id)
-  }
 
   let fundingRowId = null
   if (userId) {
@@ -95,6 +80,9 @@ async function recordFunding({
       fundingRowId = fundingRow.id
     }
   }
+
+  // funded_trees / funders_count come from individual_fundings — refresh them.
+  await syncProjectStats([project.id])
 
   return { orderId, tCO2e, fundingRowId }
 }
