@@ -870,10 +870,12 @@ router.get('/tree-records', requireAdminOrPartner, async (req, res) => {
       query = query.in('project_id', projectIds)
     }
 
-    const { data, error } = await query
+    await treeTasks.reconcileQuietly()
+    const [{ data, error }, captures] = await Promise.all([query, treeTasks.captureTreeIds()])
     if (error) throw error
 
-    res.json({ records: data || [] })
+    // Field-app captures are evidence for an existing tree, not trees of their own.
+    res.json({ records: (data || []).filter(r => !captures.has(r.id)) })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -1503,11 +1505,17 @@ router.post('/tasks/bulk-generate', requireAdminOrPartner, taskInPartnerScope, a
       return res.status(400).json({ error: 'assignee_id must belong to a known Admin, Partner or Field account' })
     }
 
-    const { data: trees, error: treeErr } = await supabase
-      .from('tree_records')
-      .select('id, tree_id, species, latitude, longitude')
-      .eq('project_id', project_id)
+    await treeTasks.reconcileQuietly()
+    const [{ data: allTrees, error: treeErr }, captures] = await Promise.all([
+      supabase
+        .from('tree_records')
+        .select('id, tree_id, species, latitude, longitude')
+        .eq('project_id', project_id),
+      treeTasks.captureTreeIds(),
+    ])
     if (treeErr) throw treeErr
+    // A field-app capture is evidence for an existing tree — it gets no task of its own.
+    const trees = (allTrees || []).filter(t => !captures.has(t.id))
 
     const { data: existingTasks } = await supabase
       .from('tasks')

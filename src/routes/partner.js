@@ -201,6 +201,38 @@ router.patch('/profile', requirePartner, async (req, res) => {
   }
 })
 
+/**
+ * Trees recorded / planted per project — one record = one tree (older records
+ * may carry a quantity). Shared by Projects and the dashboard so both show the
+ * same figures. A field-app capture that completed a planting/audit is evidence
+ * for an existing tree, not a new one, so it isn't counted. Paged — PostgREST
+ * caps a request at 1000 rows.
+ */
+async function treeCountsByProject(projectIds) {
+  const recorded = {}
+  const planted  = {}
+  const pids = [...new Set((projectIds || []).filter(Boolean))]
+  if (pids.length === 0) return { recorded, planted }
+  const withStage = await hasStageColumn()
+  const captures = await treeTasks.captureTreeIds()
+  for (let from = 0; ; from += 1000) {
+    const { data: rows, error } = await supabase
+      .from('tree_records')
+      .select('id, project_id, quantity' + (withStage ? ', stage' : ''))
+      .in('project_id', pids)
+      .range(from, from + 999)
+    if (error) throw error
+    for (const r of rows || []) {
+      if (captures.has(r.id)) continue
+      const q = Number(r.quantity) || 1
+      recorded[r.project_id] = (recorded[r.project_id] || 0) + q
+      if (withStage && r.stage && r.stage !== 'Under plantation') planted[r.project_id] = (planted[r.project_id] || 0) + q
+    }
+    if (!rows || rows.length < 1000) break
+  }
+  return { recorded, planted }
+}
+
 router.get('/dashboard', requirePartner, async (req, res) => {
   try {
     const userId = req.userId
@@ -314,6 +346,10 @@ router.get('/dashboard', requirePartner, async (req, res) => {
       })
     }
 
+    // Same tree counts as the Projects page, so a project reads the same in both.
+    await treeTasks.reconcileQuietly()
+    const { recorded, planted } = await treeCountsByProject(projects.map(p => p.id))
+
     const activeProjects = projects.map(p => {
       const funded = fundedByProject[p.id] || 0
       const done = deliveredByProject[p.id] || 0
@@ -327,6 +363,8 @@ router.get('/dashboard', requirePartner, async (req, res) => {
         delivered:     done,
         funded,
         owed:          Math.max(0, funded - done),
+        treesRecorded: recorded[p.id] || 0,
+        treesPlanted:  planted[p.id] || 0,
         progressPct:   target > 0 ? Math.min(100, Math.round((done / target) * 100)) : 0,
         fundersCount:  p.funders_count || 0,
         lastCapture:   p.last_evidence_date || null,
@@ -387,6 +425,7 @@ router.get('/dashboard', requirePartner, async (req, res) => {
 // /submissions, which tracks the review pipeline (pending/approved/rejected).
 router.get('/projects', requirePartner, async (req, res) => {
   try {
+    await treeTasks.reconcileQuietly()   // so fresh field-app captures are known as captures before counting
     const userId = req.userId
 
     const { data: subs, error: subErr } = await supabase
@@ -414,26 +453,7 @@ router.get('/projects', requirePartner, async (req, res) => {
 
     const approvedAtMap = Object.fromEntries((subs || []).map(s => [s.project_id, s.submitted_at]))
 
-    // Trees recorded / planted in each project (one record = one tree; older
-    // records may carry a quantity). Paged — PostgREST caps a request at 1000 rows.
-    const recorded = {}
-    const planted  = {}
-    const pids = (projects || []).map(p => p.id)
-    const withStage = await hasStageColumn()
-    for (let from = 0; pids.length > 0; from += 1000) {
-      const { data: rows, error: rowsErr } = await supabase
-        .from('tree_records')
-        .select('project_id, quantity' + (withStage ? ', stage' : ''))
-        .in('project_id', pids)
-        .range(from, from + 999)
-      if (rowsErr) throw rowsErr
-      for (const r of rows || []) {
-        const q = Number(r.quantity) || 1
-        recorded[r.project_id] = (recorded[r.project_id] || 0) + q
-        if (withStage && r.stage && r.stage !== 'Under plantation') planted[r.project_id] = (planted[r.project_id] || 0) + q
-      }
-      if (!rows || rows.length < 1000) break
-    }
+    const { recorded, planted } = await treeCountsByProject((projects || []).map(p => p.id))
 
     const result = (projects || []).map(p => ({
       id:              p.id,
