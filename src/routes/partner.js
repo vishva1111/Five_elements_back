@@ -2153,6 +2153,13 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
       return res.status(403).json({ error: 'That project is not one of your approved projects' })
     }
 
+    // "Quantity 5" means five trees: five records, five Tree IDs. Checked before
+    // the photo upload so a rejected entry doesn't leave an orphaned photo.
+    const count = Math.max(1, Math.floor(Number(b.quantity) || 1))
+    if (count > MAX_TREES_PER_ENTRY) {
+      return res.status(400).json({ error: `Add at most ${MAX_TREES_PER_ENTRY} trees at a time — use the spreadsheet import for more.` })
+    }
+
     // Optional photo.
     let photoUrl = null
     if (req.file) {
@@ -2214,11 +2221,6 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
     }
     Object.assign(payload, await assignmentFields(member))
 
-    // "Quantity 5" means five trees: five records, five Tree IDs.
-    const count = Math.max(1, Math.floor(Number(b.quantity) || 1))
-    if (count > MAX_TREES_PER_ENTRY) {
-      return res.status(400).json({ error: `Add at most ${MAX_TREES_PER_ENTRY} trees at a time — use the spreadsheet import for more.` })
-    }
     const rows = Array.from({ length: count }, () => ({ ...payload, tree_id: newTreeCode() }))
 
     const { data: inserted, error } = await supabase
