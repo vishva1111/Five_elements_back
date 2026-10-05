@@ -56,7 +56,7 @@ async function requireAuth(req, res, next) {
   let profile = null
   const { data: profileByAuthId } = await supabase
     .from('profiles')
-    .select('role, id, status')
+    .select('role, id, status, display_name, roles, location, created_at')
     .eq('auth_id', userId)
     .maybeSingle()
 
@@ -66,7 +66,7 @@ async function requireAuth(req, res, next) {
     // Fallback: some profiles (e.g. test users) have UUID stored as id
     const { data: profileById } = await supabase
       .from('profiles')
-      .select('role, id, status')
+      .select('role, id, status, display_name, roles, location, created_at')
       .eq('id', userId)
       .maybeSingle()
     profile = profileById
@@ -75,6 +75,7 @@ async function requireAuth(req, res, next) {
   req.userId    = userId
   req.userEmail = payload.email
   req.role      = profile?.role || 'individual'
+  req.profile   = profile   // the row above, so a route needing these fields doesn't fetch it again
 
   // A pending (not yet approved) or suspended account can't use the API — the
   // frontend already sends it to the Maintenance page, but a direct call would
