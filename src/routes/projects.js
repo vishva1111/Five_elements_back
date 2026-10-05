@@ -133,6 +133,9 @@ router.get('/', async (req, res) => {
 router.get('/:slug', async (req, res) => {
   try {
     const { slug } = req.params
+    // slug goes into a PostgREST .or() filter string — commas, dots or parens
+    // there would let a caller append their own filter conditions.
+    if (!/^[A-Za-z0-9_-]+$/.test(slug)) return res.status(404).json({ error: 'Project not found' })
 
     const { data, error } = await supabase
       .from('projects')

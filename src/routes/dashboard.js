@@ -87,14 +87,13 @@ router.get('/', async (req, res) => {
 })
 
 /**
- * GET /api/dashboard/tree-records?user_id=...
- * Recent tree records for one user — the Business dashboard's tree-records
- * widget used to run this exact query directly against Supabase.
+ * GET /api/dashboard/tree-records
+ * Recent tree records for the signed-in user. Admins may pass ?user_id= to
+ * look at someone else's; anyone else always gets their own records.
  */
 router.get('/tree-records', async (req, res) => {
   try {
-    const { user_id } = req.query
-    if (!user_id) return res.status(400).json({ error: 'user_id is required' })
+    const user_id = (req.role === 'admin' && req.query.user_id) || req.userId
 
     const { data, error } = await supabase
       .from('tree_records')

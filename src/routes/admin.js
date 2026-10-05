@@ -2,6 +2,8 @@ const express  = require('express')
 const router   = express.Router()
 const supabase = require('../supabaseClient')
 const crypto   = require('crypto')
+const fs       = require('fs')
+const path     = require('path')
 const { createNotification } = require('./notifications')
 const { sendAccountCreatedEmail } = require('../services/emailService')
 const { withSignedUrls } = require('../services/evidenceUrls')
@@ -160,7 +162,7 @@ router.post('/evidence/:id/approve', requireAdmin, async (req, res) => {
     // Fetch evidence + submission + project
     const { data: ev } = await supabase
       .from('evidence_files')
-      .select('submission_id, project_submissions(project_id, submitted_by)')
+      .select('submission_id, project_submissions(project_id, submitted_by, title)')
       .eq('id', id)
       .single()
 
@@ -169,14 +171,30 @@ router.post('/evidence/:id/approve', requireAdmin, async (req, res) => {
     const projectId = ev.project_submissions?.project_id
     const publicHash = crypto.randomBytes(16).toString('hex')
 
-    // Create ledger entry
+    const { data: project } = projectId
+      ? await supabase.from('projects').select('name').eq('id', projectId).maybeSingle()
+      : { data: null }
+
+    const trees = Number(treesVerified) || 0
+    const co2e  = Number(co2eVerified)  || 0
+
+    // Create ledger entry. id, date, project and funder are NOT NULL — this
+    // insert used to omit them and failed on every approval.
     const { error: ledgerErr } = await supabase
       .from('ledger_entries')
       .insert({
+        id:              `le-ev-${String(id).slice(0, 8)}-${Date.now().toString(36)}`,
+        date:            new Date().toISOString().slice(0, 10),
         project_id:      projectId,
+        project:         project?.name || ev.project_submissions?.title || 'Unlinked submission',
+        // Verified delivery, not a funding event — same sentinel idea as field captures.
+        funder:          'evidence-delivery',
+        trees,
+        t_co2e:          co2e,
+        verified:        true,
         evidence_id:     id,
-        trees_verified:  treesVerified || 0,
-        co2e_verified:   co2eVerified  || 0,
+        trees_verified:  trees,
+        co2e_verified:   co2e,
         approved_by:     req.adminId,
         approved_at:     new Date().toISOString(),
         public_hash:     publicHash,
@@ -822,6 +840,13 @@ router.get('/tree-records', requireAdminOrPartner, async (req, res) => {
     if (project_id) query = query.eq('project_id', project_id)
     if (health_status) query = query.eq('health_status', health_status)
 
+    // A partner sees trees on their own projects only — never another partner's.
+    if (req.role === 'partner') {
+      const { projectIds } = await partnerScope(req.userId)
+      if (projectIds.length === 0) return res.json({ records: [] })
+      query = query.in('project_id', projectIds)
+    }
+
     const { data, error } = await query
     if (error) throw error
 
@@ -836,23 +861,23 @@ router.post('/projects/:id/approve', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params
 
-    // Fetch project to get submitter + title for notification
-    const { data: project } = await supabase
-      .from('projects')
-      .select('title, created_by')
-      .eq('id', id)
-      .single()
+    // projects has `name`, not `title`, and no `created_by` — the submitter is
+    // on the submission that minted this project.
+    const [{ data: project }, { data: sub }] = await Promise.all([
+      supabase.from('projects').select('name').eq('id', id).maybeSingle(),
+      supabase.from('project_submissions').select('submitted_by').eq('project_id', id).limit(1).maybeSingle(),
+    ])
 
     const { error } = await supabase.from('projects').update({ status: 'active' }).eq('id', id)
     if (error) throw error
 
     // 6.4: Notify project submitter — project is now live on marketplace
-    if (project?.created_by) {
+    if (sub?.submitted_by) {
       await createNotification({
-        userId: project.created_by,
+        userId: sub.submitted_by,
         type:   'project_approved',
         title:  'Your project is now live ✅',
-        body:   `"${project.title || 'Your project'}" has been approved and is now visible on the marketplace.`,
+        body:   `"${project?.name || 'Your project'}" has been approved and is now visible on the marketplace.`,
         link:   `/projects`,
       })
     }
@@ -940,6 +965,14 @@ router.post('/ledger/:id/supersede', requireAdmin, async (req, res) => {
     const { data: newEntry, error: insertErr } = await supabase
       .from('ledger_entries')
       .insert({
+        // id, date, project and funder are NOT NULL — carried over from the original.
+        id:             `le-sup-${String(id).slice(0, 8)}-${Date.now().toString(36)}`,
+        date:           new Date().toISOString().slice(0, 10),
+        project:        orig.project,
+        funder:         orig.funder,
+        trees:          orig.trees,
+        t_co2e:         orig.t_co2e,
+        verified:       orig.verified,
         project_id:     orig.project_id,
         evidence_id:    orig.evidence_id,
         trees_verified: orig.trees_verified,
@@ -1028,46 +1061,89 @@ router.get('/health', requireAdmin, async (req, res) => {
 })
 
 // ─── A10: Configuration ───────────────────────────────────────────────────────
+// There is no config table in the database, so saved values are kept in a
+// JSON file next to the backend (data/admin-config.json, git-ignored) and
+// merged over these defaults. Only the editable value of each entry is stored.
+const CONFIG_DEFAULTS = {
+  featureFlags: [
+    { key: 'marketplace_public',    label: 'Public marketplace',       description: 'Show marketplace to unauthenticated users', enabled: true },
+    { key: 'partner_self_register', label: 'Partner self-registration', description: 'Allow partners to apply without invite',    enabled: true },
+    { key: 'bulk_upload',           label: 'Bulk upload',              description: 'Enable CSV bulk upload for businesses',      enabled: true },
+    { key: 'qr_verification',       label: 'QR verification',          description: 'Enable QR code on certificates',            enabled: true },
+  ],
+  emissionFactors: [
+    { key: 'electricity_uk',  label: 'UK electricity',    value: 0.21233, unit: 'kgCO₂e/kWh', source: 'DEFRA 2024' },
+    { key: 'natural_gas',     label: 'Natural gas',       value: 0.18254, unit: 'kgCO₂e/kWh', source: 'DEFRA 2024' },
+    { key: 'diesel',          label: 'Diesel (road)',      value: 2.51868, unit: 'kgCO₂e/litre', source: 'DEFRA 2024' },
+    { key: 'petrol',          label: 'Petrol (road)',      value: 2.31380, unit: 'kgCO₂e/litre', source: 'DEFRA 2024' },
+    { key: 'flight_domestic', label: 'Domestic flight',   value: 0.24510, unit: 'kgCO₂e/km/pax', source: 'DEFRA 2024' },
+  ],
+  platformSettings: [
+    { key: 'platform_fee_pct',  label: 'Platform fee (%)',       value: '5',    type: 'number' },
+    { key: 'min_funding_gbp',   label: 'Minimum funding (£)',    value: '10',   type: 'number' },
+    { key: 'default_currency',  label: 'Default currency',       value: 'GBP',  type: 'select', options: ['GBP', 'USD', 'EUR'] },
+    { key: 'support_email',     label: 'Support email',          value: 'hello@fiveelements.earth', type: 'text' },
+  ],
+}
+const CONFIG_FILE = path.join(__dirname, '../../data/admin-config.json')
+const CONFIG_SECTIONS = {
+  flags:    { list: 'featureFlags',     field: 'enabled' },
+  factors:  { list: 'emissionFactors',  field: 'value' },
+  settings: { list: 'platformSettings', field: 'value' },
+}
+
+function readSavedConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) } catch { return {} }
+}
+
+function currentConfig() {
+  const saved = readSavedConfig()
+  const out = {}
+  for (const [section, { list, field }] of Object.entries(CONFIG_SECTIONS)) {
+    out[list] = CONFIG_DEFAULTS[list].map(item =>
+      saved[section]?.[item.key] !== undefined ? { ...item, [field]: saved[section][item.key] } : item)
+  }
+  return out
+}
+
+function saveConfigSection(section) {
+  const { list, field } = CONFIG_SECTIONS[section]
+  return (req, res) => {
+    const items = req.body?.[section]
+    if (!Array.isArray(items)) return res.status(400).json({ error: `${section} must be an array` })
+    const known = new Set(CONFIG_DEFAULTS[list].map(i => i.key))
+    const values = {}
+    for (const item of items) {
+      if (!item || !known.has(item.key)) continue
+      const v = item[field]
+      if (field === 'enabled' && typeof v !== 'boolean') return res.status(400).json({ error: `${item.key}: enabled must be true or false` })
+      if (section === 'factors' && (typeof v !== 'number' || !Number.isFinite(v) || v < 0)) {
+        return res.status(400).json({ error: `${item.key}: value must be a positive number` })
+      }
+      values[item.key] = section === 'settings' ? String(v ?? '') : v
+    }
+    try {
+      const saved = readSavedConfig()
+      saved[section] = { ...(saved[section] || {}), ...values }
+      fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true })
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(saved, null, 2))
+      res.json({ success: true, ...currentConfig() })
+    } catch (err) {
+      console.error('[admin/config save]', err)
+      res.status(500).json({ error: 'Failed to save configuration' })
+    }
+  }
+}
+
 // GET /api/admin/config
-router.get('/config', requireAdmin, async (req, res) => {
-  res.json({
-    featureFlags: [
-      { key: 'marketplace_public',    label: 'Public marketplace',       description: 'Show marketplace to unauthenticated users', enabled: true },
-      { key: 'partner_self_register', label: 'Partner self-registration', description: 'Allow partners to apply without invite',    enabled: true },
-      { key: 'bulk_upload',           label: 'Bulk upload',              description: 'Enable CSV bulk upload for businesses',      enabled: true },
-      { key: 'qr_verification',       label: 'QR verification',          description: 'Enable QR code on certificates',            enabled: true },
-    ],
-    emissionFactors: [
-      { key: 'electricity_uk',  label: 'UK electricity',    value: 0.21233, unit: 'kgCO₂e/kWh', source: 'DEFRA 2024' },
-      { key: 'natural_gas',     label: 'Natural gas',       value: 0.18254, unit: 'kgCO₂e/kWh', source: 'DEFRA 2024' },
-      { key: 'diesel',          label: 'Diesel (road)',      value: 2.51868, unit: 'kgCO₂e/litre', source: 'DEFRA 2024' },
-      { key: 'petrol',          label: 'Petrol (road)',      value: 2.31380, unit: 'kgCO₂e/litre', source: 'DEFRA 2024' },
-      { key: 'flight_domestic', label: 'Domestic flight',   value: 0.24510, unit: 'kgCO₂e/km/pax', source: 'DEFRA 2024' },
-    ],
-    platformSettings: [
-      { key: 'platform_fee_pct',  label: 'Platform fee (%)',       value: '5',    type: 'number' },
-      { key: 'min_funding_gbp',   label: 'Minimum funding (£)',    value: '10',   type: 'number' },
-      { key: 'default_currency',  label: 'Default currency',       value: 'GBP',  type: 'select', options: ['GBP', 'USD', 'EUR'] },
-      { key: 'support_email',     label: 'Support email',          value: 'hello@fiveelements.earth', type: 'text' },
-    ],
-  })
+router.get('/config', requireAdmin, (req, res) => {
+  res.json(currentConfig())
 })
 
-// PATCH /api/admin/config/flags
-router.patch('/config/flags', requireAdmin, async (req, res) => {
-  // In production: persist to a config table. For now, acknowledge.
-  res.json({ success: true })
-})
-
-// PATCH /api/admin/config/factors
-router.patch('/config/factors', requireAdmin, async (req, res) => {
-  res.json({ success: true })
-})
-
-// PATCH /api/admin/config/settings
-router.patch('/config/settings', requireAdmin, async (req, res) => {
-  res.json({ success: true })
-})
+// PATCH /api/admin/config/flags | factors | settings
+router.patch('/config/flags',    requireAdmin, saveConfigSection('flags'))
+router.patch('/config/factors',  requireAdmin, saveConfigSection('factors'))
+router.patch('/config/settings', requireAdmin, saveConfigSection('settings'))
 
 // ─── Task Management (Admin) ──────────────────────────────────────────────────
 
@@ -1252,6 +1328,12 @@ router.put('/tasks/:id', requireAdminOrPartner, taskInPartnerScope, async (req, 
   try {
     const { id } = req.params
     const { name, project_id, assignee_id, target_count, location, priority, due_date, status } = req.body
+
+    // Approval publishes to the ledger and rejection notifies the field user —
+    // both have their own routes, so they can't be set by a plain edit.
+    if (status === 'approved' || status === 'rejected') {
+      return res.status(400).json({ error: `Use the ${status === 'approved' ? 'approve' : 'reject'} action to review a task` })
+    }
 
     let newAssigneeProfile = null
     if (assignee_id !== undefined) {
@@ -1495,7 +1577,7 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
         : Promise.resolve({ data: [] }),
       // The photo the field user captured lives on the linked tree record, not the task.
       treeIds.length > 0
-        ? supabase.from('tree_records').select('id, tree_id, photo_url, species, health_status').in('id', treeIds)
+        ? supabase.from('tree_records').select('id, tree_id, photo_url, species, health_status, stage').in('id', treeIds)
         : Promise.resolve({ data: [] }),
     ])
 

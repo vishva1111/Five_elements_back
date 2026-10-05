@@ -51,6 +51,9 @@ router.get('/', async (req, res) => {
 router.get('/:slug', async (req, res) => {
   try {
     const { slug } = req.params
+    // slug goes into a PostgREST .or() filter string — commas, dots or parens
+    // there would let a caller append their own filter conditions.
+    if (!/^[A-Za-z0-9_-]+$/.test(slug)) return res.status(404).json({ error: 'Profile not found' })
 
     // 1. Fetch profile by slug or id
     const { data: profile, error: profileErr } = await supabase
@@ -64,22 +67,23 @@ router.get('/:slug', async (req, res) => {
     }
 
     // 2. Fetch ledger entries for this profile (funder = profile id)
-    const { data: entries = [] } = await supabase
+    const { data: entriesData } = await supabase
       .from('ledger_entries')
       .select('*')
       .eq('funder', profile.id)
       .eq('verified', true)
       .order('date', { ascending: false })
+    const entries = entriesData || []
 
     // 3. Fetch projects funded by this profile
     const projectIds = [...new Set(entries.map(e => e.project_id))]
     let projects = []
     if (projectIds.length > 0) {
-      const { data: projData = [] } = await supabase
+      const { data: projData } = await supabase
         .from('projects')
         .select('id, name, location, certification, element')
         .in('id', projectIds)
-      projects = projData
+      projects = projData || []
     }
 
     // 4. Build tiles from ledger entries

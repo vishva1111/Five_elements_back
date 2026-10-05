@@ -1,6 +1,11 @@
 const express = require('express')
 const router = express.Router()
 const supabase = require('../supabaseClient')
+const { requireRole } = require('../middleware/auth')
+
+// Business Team page only (ProtectedRoute allows 'business'). Without this any
+// signed-in user could list, add and delete team members.
+router.use(requireRole('business', 'admin'))
 
 /**
  * GET /api/team

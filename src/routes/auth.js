@@ -3,8 +3,8 @@ const router  = express.Router()
 const { createClient } = require('@supabase/supabase-js')
 const supabase = require('../supabaseClient')
 const { sendWelcomeEmail, sendRoleAddedEmail } = require('../services/emailService')
-const crypto = require('crypto')
 const { requireAuth } = require('../middleware/auth')
+const { listAllAuthUsers } = require('../services/authUsers')
 
 // Built once at startup and reused — the two call sites below used to build
 // this same client fresh on every request (every login, and every signup
@@ -68,7 +68,7 @@ router.post('/signup', async (req, res) => {
         authErr.message?.toLowerCase().includes('already exists')) {
       // Fetch existing profile by email via auth admin (service role required)
       if (hasServiceRole) {
-        const { data: listData } = await supabase.auth.admin.listUsers()
+        const listData = await listAllAuthUsers()
         const existingUser = listData?.users?.find(u => u.email?.toLowerCase() === email.toLowerCase())
         if (existingUser) {
           // Add new role to roles array if not already present
@@ -147,41 +147,6 @@ router.post('/signup', async (req, res) => {
   })
 })
 
-// ── JWT workaround: generate a Supabase-compatible JWT manually ───────────────
-// Used when GoTrue signInWithPassword fails (Postgres 17 compatibility bug).
-function base64urlEncode(str) {
-  return Buffer.from(str).toString('base64')
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
-}
-
-function generateSupabaseJWT(userId, email, role) {
-  const secret = process.env.SUPABASE_JWT_SECRET
-  if (!secret) throw new Error('SUPABASE_JWT_SECRET not set')
-
-  const now = Math.floor(Date.now() / 1000)
-  const header  = base64urlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
-  const payload = base64urlEncode(JSON.stringify({
-    iss: 'supabase',
-    sub: userId,
-    aud: 'authenticated',
-    exp: now + 3600,   // 1 hour
-    iat: now,
-    email,
-    role: 'authenticated',
-    app_metadata:  { provider: 'email', providers: ['email'] },
-    user_metadata: { role },
-  }))
-
-  const sigInput = `${header}.${payload}`
-  const sig = crypto
-    .createHmac('sha256', Buffer.from(secret, 'base64'))
-    .update(sigInput)
-    .digest('base64')
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
-
-  return `${sigInput}.${sig}`
-}
-
 // ── POST /api/auth/login ──────────────────────────────────────────────────────
 // Body: { email, password }
 // Returns: { session, user }
@@ -201,70 +166,16 @@ router.post('/login', async (req, res) => {
       return res.json({ session: data.session, user: data.user })
     }
 
-    // ── GoTrue fallback: generate JWT manually for Postgres 17 session-creation bug ──
-    // When GoTrue fails to create a session (not a credentials error), we generate
-    // a valid Supabase JWT using the JWT secret so the user can still log in.
-    const jwtSecret = process.env.SUPABASE_JWT_SECRET
-    const isCredentialsError =
-      error.message?.toLowerCase().includes('invalid') ||
-      error.message?.toLowerCase().includes('credentials') ||
-      error.message?.toLowerCase().includes('wrong password') ||
-      error.message?.toLowerCase().includes('email not confirmed')
-
-    if (jwtSecret && !isCredentialsError) {
-      try {
-        // Fetch user by email using admin API to get their UUID
-        const { data: listData } = await supabase.auth.admin.listUsers({ perPage: 1000 })
-        const authUser = listData?.users?.find(u => u.email?.toLowerCase() === email.toLowerCase().trim())
-
-        if (authUser) {
-          // Fetch profile for role
-          const { data: profile } = await supabase
-            .from('profiles')
-            .select('role, display_name')
-            .eq('auth_id', authUser.id)
-            .maybeSingle()
-
-          const userRole = profile?.role || 'individual'
-          const accessToken = generateSupabaseJWT(authUser.id, authUser.email, userRole)
-          const now = Math.floor(Date.now() / 1000)
-
-          console.log(`[login] JWT fallback used for ${authUser.email} (GoTrue error: ${error.message})`)
-
-          return res.json({
-            session: {
-              access_token:  accessToken,
-              refresh_token: '',
-              expires_in:    3600,
-              expires_at:    now + 3600,
-              token_type:    'bearer',
-              user: {
-                id:    authUser.id,
-                email: authUser.email,
-                role:  'authenticated',
-                user_metadata: authUser.user_metadata || {},
-                app_metadata:  authUser.app_metadata  || {},
-              },
-            },
-            user: {
-              id:    authUser.id,
-              email: authUser.email,
-              role:  'authenticated',
-              user_metadata: authUser.user_metadata || {},
-            },
-          })
-        }
-      } catch (fallbackErr) {
-        console.warn('[login] JWT fallback error:', fallbackErr.message)
-      }
-    }
-
-    // Standard error responses
-    if (isCredentialsError) {
-      return res.status(401).json({ error: 'Invalid email or password' })
-    }
-    if (error.message?.toLowerCase().includes('confirm')) {
+    // No fallback that mints a token here: one used to, for any GoTrue error
+    // that wasn't a credentials error (rate limits included), without ever
+    // checking the password. Its HS256 tokens were also rejected by
+    // requireAuth, which verifies Supabase's ES256 key — so it only added risk.
+    const msg = error.message?.toLowerCase() || ''
+    if (msg.includes('confirm')) {
       return res.status(401).json({ error: 'Please confirm your email before logging in.' })
+    }
+    if (msg.includes('invalid') || msg.includes('credentials') || msg.includes('wrong password')) {
+      return res.status(401).json({ error: 'Invalid email or password' })
     }
     return res.status(400).json({ error: error.message })
 
@@ -337,6 +248,13 @@ router.patch('/role', requireAuth, async (req, res) => {
   try {
     const { role } = req.body
     if (!role) return res.status(400).json({ error: 'role is required' })
+
+    // Only switch to a role this account already holds — otherwise any user
+    // could PATCH { role: 'admin' } and requireAuth would grant admin access.
+    const profile = await loadProfile(req.userId)
+    if (!profile || !profile.roles.includes(role)) {
+      return res.status(403).json({ error: 'You do not have access to this role' })
+    }
 
     const { error } = await supabase
       .from('profiles')
