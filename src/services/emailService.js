@@ -279,4 +279,87 @@ async function sendAccountCreatedEmail({ toEmail, displayName, roleLabel, tempPa
   }
 }
 
-module.exports = { sendWelcomeEmail, sendRoleAddedEmail, sendAccountCreatedEmail }
+// Same frame as the emails above: header band, body, one call-to-action button.
+function brandedEmail({ heading, bodyHtml, ctaLabel, ctaUrl, footnote = '' }) {
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+          <tr>
+            <td style="background:linear-gradient(135deg,#1a6b3c 0%,#2d9e5f 100%);padding:40px;text-align:center;">
+              <h1 style="color:#ffffff;margin:0;font-size:28px;">🌿 Five Elements</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:40px;">
+              <h2 style="color:#1a6b3c;margin:0 0 16px;">${heading}</h2>
+              ${bodyHtml}
+              <table cellpadding="0" cellspacing="0" style="margin:0 auto;">
+                <tr>
+                  <td style="background:#1a6b3c;border-radius:8px;padding:14px 32px;">
+                    <a href="${ctaUrl}" style="color:#ffffff;text-decoration:none;font-size:16px;font-weight:600;">${ctaLabel}</a>
+                  </td>
+                </tr>
+              </table>
+              ${footnote ? `<p style="color:#888;font-size:13px;line-height:1.6;margin:24px 0 0;">${footnote}</p>` : ''}
+            </td>
+          </tr>
+          <tr>
+            <td style="background:#f4f7f6;padding:20px 40px;text-align:center;">
+              <p style="color:#aaa;font-size:12px;margin:0;">© ${new Date().getFullYear()} Five Elements. All rights reserved.</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`.trim()
+}
+
+/** Sent when an admin approves a pending sign-up — the Maintenance page promises it. */
+async function sendAccountApprovedEmail({ toEmail, displayName }) {
+  const appUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
+  try {
+    await sendBrevoEmail({
+      toEmail,
+      toName:  displayName,
+      subject: 'Your Five Elements account is approved',
+      htmlContent: brandedEmail({
+        heading:  'Your account is approved',
+        bodyHtml: `<p style="color:#444;font-size:16px;line-height:1.6;margin:0 0 28px;">Hi ${displayName || 'there'}, your Five Elements account has been approved. You can sign in now.</p>`,
+        ctaLabel: 'Sign In →',
+        ctaUrl:   `${appUrl}/login`,
+      }),
+    })
+  } catch (err) {
+    console.error('[emailService] sendAccountApprovedEmail failed:', err.message)
+  }
+}
+
+/** Password reset link. Never throws — the caller answers the same either way. */
+async function sendPasswordResetEmail({ toEmail, displayName, resetUrl }) {
+  try {
+    await sendBrevoEmail({
+      toEmail,
+      toName:  displayName,
+      subject: 'Reset your Five Elements password',
+      htmlContent: brandedEmail({
+        heading:  'Reset your password',
+        bodyHtml: `<p style="color:#444;font-size:16px;line-height:1.6;margin:0 0 28px;">Hi ${displayName || 'there'}, we received a request to reset your password. Click below to choose a new one.</p>`,
+        ctaLabel: 'Choose a new password →',
+        ctaUrl:   resetUrl,
+        footnote: 'This link works once and expires in 1 hour. If you didn\'t ask for this, you can ignore this email — your password stays the same.',
+      }),
+    })
+  } catch (err) {
+    console.error('[emailService] sendPasswordResetEmail failed:', err.message)
+  }
+}
+
+module.exports = { sendWelcomeEmail, sendRoleAddedEmail, sendAccountCreatedEmail, sendAccountApprovedEmail, sendPasswordResetEmail }

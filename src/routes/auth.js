@@ -2,9 +2,12 @@ const express = require('express')
 const router  = express.Router()
 const { createClient } = require('@supabase/supabase-js')
 const supabase = require('../supabaseClient')
-const { sendWelcomeEmail, sendRoleAddedEmail } = require('../services/emailService')
+const { sendWelcomeEmail, sendRoleAddedEmail, sendPasswordResetEmail } = require('../services/emailService')
 const { requireAuth } = require('../middleware/auth')
 const { listAllAuthUsers } = require('../services/authUsers')
+const { createNotification } = require('./notifications')
+
+const MIN_PASSWORD = 8
 
 // Built once at startup and reused — the two call sites below used to build
 // this same client fresh on every request (every login, and every signup
@@ -139,6 +142,19 @@ router.post('/signup', async (req, res) => {
     displayName: fullName.trim(),
     role:        requestedRole,
   })
+
+  // New accounts start 'pending' and can't use the app until an admin approves
+  // them — tell the admins, so the account doesn't sit unnoticed.
+  if (!profileErr) {
+    const { data: admins } = await supabase.from('profiles').select('auth_id').eq('role', 'admin').not('auth_id', 'is', null)
+    await Promise.all((admins || []).map(a => createNotification({
+      userId: a.auth_id,
+      type:   'user_pending',
+      title:  `New ${requestedRole} sign-up awaiting approval`,
+      body:   `${fullName.trim()} (${email}) signed up and is waiting for approval.`,
+      link:   '/admin/users',
+    })))
+  }
 
   return res.status(201).json({
     message: 'Account created successfully.',
@@ -286,6 +302,117 @@ router.post('/refresh', async (req, res) => {
   } catch (err) {
     console.error('[POST /api/auth/refresh]', err)
     res.status(500).json({ error: 'Failed to refresh session' })
+  }
+})
+
+// ── POST /api/auth/first-login-done ───────────────────────────────────────────
+// The Welcome page calls this once it has been shown. Nothing cleared the flag
+// before, so every sign-in landed on Welcome again.
+router.post('/first-login-done', requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase.from('profiles').update({ is_first_login: false }).eq('auth_id', req.userId)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[POST /api/auth/first-login-done]', err)
+    res.status(500).json({ error: 'Failed to update profile' })
+  }
+})
+
+// ── POST /api/auth/forgot-password ────────────────────────────────────────────
+// Body: { email }. Emails a one-time reset link (via Brevo, like every other
+// email here). The link carries Supabase's recovery token_hash to our own
+// /reset-password page, so no redirect URL has to be allow-listed in Supabase.
+// Always answers the same, so it can't be used to find out who has an account.
+// One reset email per address per minute, so the endpoint can't be used to
+// flood someone's inbox or burn the daily Brevo quota. In-memory is enough for
+// this single backend process.
+const RESET_EMAIL_GAP_MS = 60 * 1000
+const lastResetEmail = new Map()
+
+router.post('/forgot-password', async (req, res) => {
+  const email = String(req.body?.email || '').toLowerCase().trim()
+  if (!email) return res.status(400).json({ error: 'Email is required.' })
+  const answer = { message: 'If an account exists for that email, a reset link is on its way.' }
+
+  const now = Date.now()
+  if (now - (lastResetEmail.get(email) || 0) < RESET_EMAIL_GAP_MS) return res.json(answer)
+  lastResetEmail.set(email, now)
+  for (const [key, at] of lastResetEmail) if (now - at > RESET_EMAIL_GAP_MS) lastResetEmail.delete(key)
+
+  try {
+    const listed = await listAllAuthUsers()
+    const authUser = (listed?.users || []).find(u => u.email?.toLowerCase() === email)
+    if (!authUser) return res.json(answer)
+
+    const { data, error } = await supabase.auth.admin.generateLink({ type: 'recovery', email })
+    if (error || !data?.properties?.hashed_token) {
+      console.error('[forgot-password] generateLink failed:', error?.message)
+      return res.json(answer)
+    }
+
+    const appUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
+    await sendPasswordResetEmail({
+      toEmail:     authUser.email,
+      displayName: authUser.user_metadata?.display_name || '',
+      resetUrl:    `${appUrl}/reset-password?token=${encodeURIComponent(data.properties.hashed_token)}`,
+    })
+    res.json(answer)
+  } catch (err) {
+    console.error('[POST /api/auth/forgot-password]', err)
+    res.json(answer)
+  }
+})
+
+// ── POST /api/auth/reset-password ─────────────────────────────────────────────
+// Body: { token, password } — token is the token_hash from the emailed link.
+router.post('/reset-password', async (req, res) => {
+  const { token, password } = req.body || {}
+  if (!token) return res.status(400).json({ error: 'This reset link is incomplete — request a new one.' })
+  if (!password || String(password).length < MIN_PASSWORD) {
+    return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD} characters.` })
+  }
+
+  try {
+    const { data, error } = await anonClient.auth.verifyOtp({ type: 'recovery', token_hash: String(token) })
+    if (error || !data?.user) {
+      return res.status(400).json({ error: 'This reset link has expired or was already used — request a new one.' })
+    }
+    const { error: upErr } = await supabase.auth.admin.updateUserById(data.user.id, { password: String(password) })
+    if (upErr) throw upErr
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[POST /api/auth/reset-password]', err)
+    res.status(500).json({ error: 'Failed to reset password — please try again.' })
+  }
+})
+
+// ── POST /api/auth/change-password ────────────────────────────────────────────
+// Body: { currentPassword, newPassword } — for a signed-in user, e.g. to replace
+// the temporary password an admin or partner created the account with.
+router.post('/change-password', requireAuth, async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {}
+  if (!currentPassword) return res.status(400).json({ error: 'Enter your current password.' })
+  if (!newPassword || String(newPassword).length < MIN_PASSWORD) {
+    return res.status(400).json({ error: `New password must be at least ${MIN_PASSWORD} characters.` })
+  }
+  if (currentPassword === newPassword) {
+    return res.status(400).json({ error: 'New password must be different from the current one.' })
+  }
+
+  try {
+    const { error: checkErr } = await anonClient.auth.signInWithPassword({
+      email: String(req.userEmail || '').toLowerCase(),
+      password: String(currentPassword),
+    })
+    if (checkErr) return res.status(400).json({ error: 'Current password is incorrect.' })
+
+    const { error } = await supabase.auth.admin.updateUserById(req.userId, { password: String(newPassword) })
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[POST /api/auth/change-password]', err)
+    res.status(500).json({ error: 'Failed to change password — please try again.' })
   }
 })
 

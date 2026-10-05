@@ -56,7 +56,7 @@ async function requireAuth(req, res, next) {
   let profile = null
   const { data: profileByAuthId } = await supabase
     .from('profiles')
-    .select('role, id')
+    .select('role, id, status')
     .eq('auth_id', userId)
     .maybeSingle()
 
@@ -66,7 +66,7 @@ async function requireAuth(req, res, next) {
     // Fallback: some profiles (e.g. test users) have UUID stored as id
     const { data: profileById } = await supabase
       .from('profiles')
-      .select('role, id')
+      .select('role, id, status')
       .eq('id', userId)
       .maybeSingle()
     profile = profileById
@@ -75,6 +75,15 @@ async function requireAuth(req, res, next) {
   req.userId    = userId
   req.userEmail = payload.email
   req.role      = profile?.role || 'individual'
+
+  // A pending (not yet approved) or suspended account can't use the API — the
+  // frontend already sends it to the Maintenance page, but a direct call would
+  // otherwise go through. /api/auth/* stays open: /me is how the frontend
+  // learns the status, and password change/reset must keep working.
+  const blocked = ['pending', 'suspended'].includes(profile?.status) && req.role !== 'admin'
+  if (blocked && !req.originalUrl.startsWith('/api/auth/')) {
+    return res.status(403).json({ error: 'Your account is not active yet.', status: profile.status })
+  }
 
   next()
 }

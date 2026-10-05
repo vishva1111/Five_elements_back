@@ -5,7 +5,7 @@ const crypto   = require('crypto')
 const fs       = require('fs')
 const path     = require('path')
 const { createNotification } = require('./notifications')
-const { sendAccountCreatedEmail } = require('../services/emailService')
+const { sendAccountCreatedEmail, sendAccountApprovedEmail } = require('../services/emailService')
 const { withSignedUrls } = require('../services/evidenceUrls')
 const { listAllAuthUsers } = require('../services/authUsers')
 const {
@@ -781,8 +781,31 @@ router.patch('/users/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params
     const { status } = req.body
+    if (!['active', 'suspended', 'pending'].includes(status)) {
+      return res.status(400).json({ error: 'status must be active, suspended or pending' })
+    }
+
+    const { data: before } = await supabase.from('profiles').select('auth_id, display_name, status').eq('id', id).maybeSingle()
+    if (!before) return res.status(404).json({ error: 'User not found' })
+
     const { error } = await supabase.from('profiles').update({ status }).eq('id', id)
     if (error) throw error
+
+    // Approving a pending sign-up: the Maintenance page tells them to expect an email.
+    if (before.status === 'pending' && status === 'active' && before.auth_id) {
+      const { data: authUser } = await supabase.auth.admin.getUserById(before.auth_id)
+      if (authUser?.user?.email) {
+        await sendAccountApprovedEmail({ toEmail: authUser.user.email, displayName: before.display_name })
+      }
+      await createNotification({
+        userId: before.auth_id,
+        type:   'account_approved',
+        title:  'Your account is approved ✅',
+        body:   'Welcome to Five Elements — you can now use your dashboard.',
+        link:   null,
+      })
+    }
+
     res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })
