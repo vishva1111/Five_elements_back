@@ -173,7 +173,104 @@ async function assignPlantingTask(treeId, assigneeId, partnerUserId) {
   return data
 }
 
+// ── Field-app completions ─────────────────────────────────────────────────────
+// When the field app completes a task it overwrites tasks.tree_id with the new
+// capture record it just saved, and never sets capture_tree_id. The tree then
+// loses its task (no "Review planting" on Assign action) and an approval marks
+// the capture Planted instead of the tree. The app isn't changed here, so the
+// backend repairs it: every task it creates names its tree's code —
+// "Plant — Mahogany (TREE-D2Y5DD2)" — and codes are unique, so the task is
+// moved back onto that tree and the capture kept as capture_tree_id.
+const TREE_CODE_RE = /\((TREE-[A-Z0-9]+)\)/
+const RECONCILE_EVERY_MS = 5000
+let lastReconcile = 0
+let reconciling = null
+
+/**
+ * Re-points field-app-completed tasks at their own tree. Cheap enough to run
+ * on reads (throttled); pass { force: true } right before acting on a task.
+ * Returns the number of tasks fixed.
+ */
+async function reconcileCaptureTasks({ force = false } = {}) {
+  if (reconciling) return reconciling
+  if (!force && Date.now() - lastReconcile < RECONCILE_EVERY_MS) return 0
+  reconciling = (async () => {
+    try {
+      if (!(await hasTaskTypeColumns())) return 0
+      return await runReconcile()
+    } finally {
+      lastReconcile = Date.now()
+      reconciling = null
+    }
+  })()
+  return reconciling
+}
+
+async function runReconcile() {
+  const { data: tasks, error } = await supabase
+    .from('tasks')
+    .select('id, name, tree_id, capture_tree_id, task_type, status, created_by, reviewed_by')
+    .like('name', '%(TREE-%')
+    .not('tree_id', 'is', null)
+  if (error) throw error
+
+  const coded = (tasks || [])
+    .map(t => ({ ...t, code: (t.name.match(TREE_CODE_RE) || [])[1] }))
+    .filter(t => t.code)
+  const codes = [...new Set(coded.map(t => t.code))]
+  if (codes.length === 0) return 0
+
+  const treeIdByCode = {}
+  for (let i = 0; i < codes.length; i += 300) {
+    const { data, error: treeErr } = await supabase
+      .from('tree_records')
+      .select('id, tree_id')
+      .in('tree_id', codes.slice(i, i + 300))
+    if (treeErr) throw treeErr
+    for (const r of data || []) treeIdByCode[r.tree_id] = r.id
+  }
+
+  let fixed = 0
+  const approvedPlantings = []
+  for (const t of coded) {
+    const treeId = treeIdByCode[t.code]
+    if (!treeId || t.tree_id === treeId) continue
+    const captureId = t.capture_tree_id || t.tree_id
+    const { error: upErr } = await supabase
+      .from('tasks')
+      .update({ tree_id: treeId, capture_tree_id: captureId })
+      .eq('id', t.id)
+      .eq('tree_id', t.tree_id)   // untouched since we read it
+    if (upErr) { console.error('[treeTasks] reconcile failed for task', t.id, upErr.message); continue }
+    fixed++
+    if (typeOf(t) === PLANTING && t.status === 'approved') {
+      approvedPlantings.push({ ...t, tree_id: treeId, capture_tree_id: captureId })
+    }
+  }
+
+  // An approval that ran while the task pointed at the capture planted the
+  // capture and opened the audit there. Move that audit to the tree, then
+  // apply the approval to the tree itself (idempotent: stage + audit task).
+  for (const task of approvedPlantings) {
+    await supabase
+      .from('tasks')
+      .update({ tree_id: task.tree_id })
+      .eq('tree_id', task.capture_tree_id)
+      .eq('task_type', AUDIT)
+    await onPlantingApproved(task, task.reviewed_by || task.created_by)
+  }
+
+  if (fixed > 0) console.log(`[treeTasks] re-linked ${fixed} field-app task(s) to their trees`)
+  return fixed
+}
+
+/** reconcileCaptureTasks for read paths — a repair failure must never break the page. */
+async function reconcileQuietly() {
+  try { await reconcileCaptureTasks() } catch (e) { console.error('[treeTasks] reconcile:', e.message) }
+}
+
 module.exports = {
+  reconcileCaptureTasks, reconcileQuietly,
   assignPlantingTask,
   PLANTING, AUDIT, typeOf,
   hasTaskTypeColumns, tasksForTrees, captureTreeIds,
