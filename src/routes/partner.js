@@ -51,6 +51,7 @@ const { parseTreeSheet, templateCsv, MAX_ROWS } = require('../services/treeImpor
 const { parseDonorSheet, templateCsv: donorTemplateCsv } = require('../services/donorImport')
 const { recordFunding } = require('../services/funding')
 const { syncProjectStats } = require('../services/projectStats')
+const treeTasks = require('../services/treeTasks')
 const { listAllAuthUsers } = require('../services/authUsers')
 const {
   generateTempPassword,
@@ -1696,31 +1697,15 @@ router.post('/species', requirePartner, async (req, res) => {
 })
 
 // Tree lifecycle stages the partner can set (Assign action form / edit).
-const TREE_STAGES = ['Under plantation', 'Planted', 'Growing', 'Established', 'Needs care', 'Dead']
+const TREE_STAGES = ['Under plantation', 'Planted']
 
-// Flow: Under plantation (no task) → Planted → a verification task appears in
-// Tasks → partner assigns a Field Operator → in progress → completed → partner
-// approves (ledger) or rejects (redo). Stages from Planted on need that check.
-const TASK_STAGES = ['Planted', 'Growing', 'Established', 'Needs care']
+// Flow: tree added (Under plantation) → planting task → field operator plants it
+// → partner approves → Planted → audit task → field operator surveys it →
+// partner approves (ledger) or rejects (redo). Stages from Planted on need the audit.
+const TASK_STAGES = ['Planted']
 
-/** Creates the verification task for a planted tree, unless it already has one. */
-async function ensureVerificationTask(treeId, partnerUserId) {
-  const { data: existingTask } = await supabase.from('tasks').select('id').eq('tree_id', treeId).maybeSingle()
-  if (existingTask) return null
-  const { data: tree } = await supabase
-    .from('tree_records')
-    .select('id, tree_id, species, latitude, longitude, project_id')
-    .eq('id', treeId)
-    .maybeSingle()
-  if (!tree) return null
-  const created = await autoCreateVerificationTasks({
-    trees: [{ id: tree.id, code: tree.tree_id, species: tree.species, latitude: tree.latitude, longitude: tree.longitude }],
-    projectId: tree.project_id,
-    partnerUserId,
-    anyOwner: true,
-  })
-  return created[0] || null
-}
+/** Audit task for a planted tree, unless it already has one (see services/treeTasks.js). */
+const ensureVerificationTask = (treeId, partnerUserId) => treeTasks.ensureAuditTask(treeId, partnerUserId)
 
 // `stage`, `team_member_id` and `assigned_to` come from migration 005_tree_stage.sql.
 // Until it has been run, keep everything working without them instead of
@@ -1792,8 +1777,11 @@ router.get('/trees', requirePartner, async (req, res) => {
     if (req.query.project_id) query = query.eq('project_id', req.query.project_id)
     if (req.query.user_id)    query = query.eq('user_id', req.query.user_id)
 
-    const { data, error } = await query
+    const { data: rawTrees, error } = await query
     if (error) throw error
+    // A field-app capture that completed a task is evidence for its tree, not a tree of its own.
+    const captures = await treeTasks.captureTreeIds()
+    const data = (rawTrees || []).filter(t => !captures.has(t.id))
 
     const uniqueUserIds = [...new Set((data || []).map(t => t.user_id))]
     const uniqueProjectIds = [...new Set((data || []).map(t => t.project_id))]
@@ -1805,11 +1793,27 @@ router.get('/trees', requirePartner, async (req, res) => {
         ? supabase.from('projects').select('id, name').in('id', uniqueProjectIds)
         : Promise.resolve({ data: [] }),
       // So the list can show "task pending" / "verified" without a second round trip per row.
-      supabase.from('tasks').select('id, tree_id, status, assignee_id, created_by').in('tree_id', (data || []).map(t => t.id)),
+      treeTasks.tasksForTrees((data || []).map(t => t.id)),
     ])
     const nameMap    = Object.fromEntries((namesRes.data || []).map(p => [p.auth_id, p.display_name]))
     const projectMap = Object.fromEntries((projectsRes.data || []).map(p => [p.id, p.name]))
-    const taskMap     = Object.fromEntries((tasksRes.data || []).map(t => [t.tree_id, t]))
+    // The task that matters right now: planting while under plantation, audit after.
+    const taskMap = {}
+    for (const t of data || []) {
+      const slot = tasksRes[t.id] || {}
+      const planted = t.stage && t.stage !== 'Under plantation'
+      taskMap[t.id] = planted ? (slot.audit || null) : (slot.planting || (withStage ? null : slot.audit) || null)
+    }
+    // Names of the field operators on those tasks, and the captures that completed them.
+    const currentTasks = Object.values(taskMap).filter(Boolean)
+    const assigneeIds = [...new Set(currentTasks.map(t => t.assignee_id).filter(Boolean))]
+    const captureIds  = [...new Set(currentTasks.map(t => t.capture_tree_id).filter(Boolean))]
+    const [assigneesRes, capturesRes] = await Promise.all([
+      assigneeIds.length ? supabase.from('profiles').select('auth_id, display_name').in('auth_id', assigneeIds) : Promise.resolve({ data: [] }),
+      captureIds.length  ? supabase.from('tree_records').select('id, photo_url').in('id', captureIds)            : Promise.resolve({ data: [] }),
+    ])
+    const assigneeNames = Object.fromEntries((assigneesRes.data || []).map(p => [p.auth_id, p.display_name]))
+    const capturesById  = Object.fromEntries((capturesRes.data || []).map(c => [c.id, c]))
 
     res.json({
       trees: (data || []).map(t => ({
@@ -1839,6 +1843,12 @@ router.get('/trees', requirePartner, async (req, res) => {
         surveyDate:      t.survey_date,
         taskStatus:      taskMap[t.id]?.status || null,
         taskId:          taskMap[t.id]?.id || null,
+        taskType:        taskMap[t.id] ? treeTasks.typeOf(taskMap[t.id]) : null,
+        taskAssigneeId:  taskMap[t.id]?.assignee_id || null,
+        taskAssignee:    taskMap[t.id] ? (assigneeNames[taskMap[t.id].assignee_id] || null) : null,
+        // The field capture that completed the task: its photo + where it was taken.
+        capturePhoto:    taskMap[t.id]?.capture_tree_id ? (capturesById[taskMap[t.id].capture_tree_id]?.photo_url || null) : null,
+        captureLocation: taskMap[t.id]?.location || null,
         // Auto-created tasks start on the partner as a placeholder until a Field Operator is picked.
         taskNeedsAssignee: !!taskMap[t.id] && taskMap[t.id].status === 'assigned' && taskMap[t.id].assignee_id === taskMap[t.id].created_by,
       })),
@@ -1864,11 +1874,13 @@ router.get('/trees/:id', requirePartner, async (req, res) => {
       return res.status(404).json({ error: 'Tree record not found' })
     }
 
-    const [{ data: project }, { data: owner }, { data: task }] = await Promise.all([
+    const [{ data: project }, { data: owner }, taskSlots] = await Promise.all([
       supabase.from('projects').select('id, name').eq('id', tree.project_id).maybeSingle(),
       supabase.from('profiles').select('display_name').eq('auth_id', tree.user_id).maybeSingle(),
-      supabase.from('tasks').select('id, task_code, status, assignee_id').eq('tree_id', tree.id).maybeSingle(),
+      treeTasks.tasksForTrees([tree.id]),
     ])
+    const slot = taskSlots[tree.id] || {}
+    const task = slot.audit || slot.planting || null
 
     res.json({
       tree: {
@@ -1877,6 +1889,8 @@ router.get('/trees/:id', requirePartner, async (req, res) => {
         recordedFor: owner?.display_name || '—',
       },
       task: task || null,
+      plantingTask: slot.planting || null,
+      auditTask:    slot.audit || null,
     })
   } catch (err) {
     console.error('[partner/trees/:id GET]', err)
@@ -1910,11 +1924,7 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
 
     // A record already folded into the ledger is done — the platform's public
     // record should not be quietly rewritten after the fact.
-    const { data: linkedTask } = await supabase
-      .from('tasks')
-      .select('id, status')
-      .eq('tree_id', existing.id)
-      .maybeSingle()
+    const linkedTask = (await treeTasks.tasksForTrees([existing.id]))[existing.id]?.audit || null
     if (linkedTask?.status === 'approved') {
       return res.status(409).json({ error: 'This record has already been verified and is on the ledger — it can no longer be edited.' })
     }
@@ -1949,6 +1959,14 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
         return res.status(400).json({ error: 'Stages are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
       }
       updates.stage = req.body.stage
+      // A tree only becomes Planted when a field operator has planted it and the
+      // partner confirmed it (planting task) — not by changing the stage here.
+      if (TASK_STAGES.includes(req.body.stage) && (await treeTasks.hasTaskTypeColumns())) {
+        const { data: cur } = await supabase.from('tree_records').select('stage').eq('id', existing.id).maybeSingle()
+        if (!cur?.stage || cur.stage === 'Under plantation') {
+          return res.status(409).json({ error: 'Assign a field operator to plant this tree first — it becomes Planted when you confirm their planting in Tasks.' })
+        }
+      }
     }
     if (updates.species === null) return res.status(400).json({ error: 'Species cannot be empty' })
     if (updates.quantity !== undefined) {
@@ -1979,6 +1997,55 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
 // once the record is gone there's nothing left to verify. An approved task means
 // the record already reached the ledger, so both stay: undoing them here would
 // silently corrupt the public record the ledger promises to be trustworthy.
+// ── POST /api/partner/trees/assign-planting — send trees to a field operator ─
+// Body: { tree_ids: string[], assignee_id }. Each tree's planting task (created
+// if missing) goes to that field operator; the tree stays "Under plantation"
+// until the partner confirms the planting in Tasks.
+router.post('/trees/assign-planting', requirePartner, async (req, res) => {
+  try {
+    const treeIds = Array.isArray(req.body?.tree_ids) ? req.body.tree_ids.filter(Boolean) : []
+    const assigneeId = req.body?.assignee_id
+    if (treeIds.length === 0) return res.status(400).json({ error: 'Choose at least one tree' })
+    if (!assigneeId) return res.status(400).json({ error: 'Choose a field operator' })
+    if (!(await treeTasks.hasTaskTypeColumns())) {
+      return res.status(400).json({ error: 'Planting tasks are not set up in the database yet — run the setup SQL in Supabase.' })
+    }
+
+    const { data: person } = await supabase.from('profiles').select('auth_id, display_name').eq('auth_id', assigneeId).maybeSingle()
+    if (!person) return res.status(400).json({ error: 'That field operator does not exist' })
+
+    const { userIds } = await partnerOwnedUserIds(req.userId)
+    const { data: trees } = await supabase.from('tree_records').select('id, user_id, tree_id, stage').in('id', treeIds)
+    const mine = (trees || []).filter(t => userIds.includes(t.user_id))
+    if (mine.length === 0) return res.status(404).json({ error: 'Tree record not found' })
+    const planted = mine.filter(t => t.stage && t.stage !== 'Under plantation')
+    if (planted.length > 0) {
+      return res.status(409).json({ error: `${planted.map(t => t.tree_id || t.id.slice(0, 8)).join(', ')} ${planted.length === 1 ? 'is' : 'are'} already planted.` })
+    }
+
+    const assigned = []
+    for (const t of mine) {
+      const task = await treeTasks.assignPlantingTask(t.id, assigneeId, req.userId)
+      if (task) assigned.push(task)
+    }
+
+    if (assigned.length > 0) {
+      await createNotification({
+        userId: assigneeId,
+        type:   'task_assigned',
+        title:  assigned.length === 1 ? `Planting task assigned: ${assigned[0].name}` : `${assigned.length} planting tasks assigned to you`,
+        body:   'Plant the tree, then capture it in the app to complete the task.',
+        link:   '/app/tasks',
+      }).catch(() => {})
+    }
+
+    res.json({ assigned: assigned.length, assignee: person.display_name, tasks: assigned })
+  } catch (err) {
+    console.error('[partner/trees/assign-planting]', err)
+    res.status(500).json({ error: err.message || 'Failed to assign planting' })
+  }
+})
+
 router.delete('/trees/:id', requirePartner, async (req, res) => {
   try {
     const { userIds } = await partnerOwnedUserIds(req.userId)
@@ -1992,18 +2059,14 @@ router.delete('/trees/:id', requirePartner, async (req, res) => {
       return res.status(404).json({ error: 'Tree record not found' })
     }
 
-    const { data: linkedTask } = await supabase
-      .from('tasks')
-      .select('id, status')
-      .eq('tree_id', existing.id)
-      .maybeSingle()
-
-    if (linkedTask?.status === 'approved') {
+    const slot = (await treeTasks.tasksForTrees([existing.id]))[existing.id] || { all: [] }
+    if (slot.audit?.status === 'approved') {
       return res.status(409).json({ error: 'This record has already been verified and is on the ledger — it can no longer be deleted.' })
     }
 
+    const linkedTask = slot.all.length > 0
     if (linkedTask) {
-      await supabase.from('tasks').delete().eq('id', linkedTask.id)
+      await supabase.from('tasks').delete().in('id', slot.all.map(t => t.id))
     }
 
     const { error } = await supabase.from('tree_records').delete().eq('id', existing.id)
@@ -2172,10 +2235,13 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
     // not while it is still under plantation. Without the stage column, keep
     // the original rule (Business/Individual owners get a task straight away).
     const treesForTasks = inserted.map(t => ({ id: t.id, code: t.tree_id, species: t.species, latitude, longitude }))
+    // Under plantation → a planting task each; already planted → an audit task each.
+    // Without the stage column, keep the original rule.
     const tasksCreated = payload.stage !== undefined
-      ? (TASK_STAGES.includes(payload.stage)
-          ? await autoCreateVerificationTasks({ trees: treesForTasks, projectId, partnerUserId, anyOwner: true })
-          : [])
+      ? await treeTasks.createTreeTasks({
+          trees: treesForTasks, projectId, partnerUserId,
+          type: TASK_STAGES.includes(payload.stage) ? treeTasks.AUDIT : treeTasks.PLANTING,
+        })
       : await autoCreateVerificationTasks({ trees: treesForTasks, projectId, partnerUserId, ownerRole: member.role })
 
     const who = member.name || member.email
@@ -2355,7 +2421,7 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
     const { data, error } = await supabase
       .from('tree_records')
       .insert(payload)
-      .select('id')
+      .select('id, tree_id')
 
     if (error) throw error
 
@@ -2365,7 +2431,12 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
     // pairing by index is safe here.
     // Imported rows start as "Under plantation" once stages exist, so their
     // tasks appear when each tree is marked Planted.
-    const tasksCreated = (await hasStageColumn()) ? [] : await autoCreateVerificationTasks({
+    const tasksCreated = (await hasStageColumn())
+      ? await treeTasks.createTreeTasks({
+          trees: data.map((row, i) => ({ id: row.id, code: row.tree_id, species: expanded[i].species, latitude: expanded[i].latitude, longitude: expanded[i].longitude })),
+          projectId, partnerUserId, type: treeTasks.PLANTING,
+        })
+      : await autoCreateVerificationTasks({
       trees: data.map((row, i) => ({
         id:        row.id,
         species:   expanded[i].species,

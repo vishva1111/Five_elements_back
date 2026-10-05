@@ -20,6 +20,7 @@ const {
 } = require('../services/adminHelpers')
 const { partnerScope } = require('../services/partnerHelpers')
 const { syncProjectStats, syncAllProjectStats } = require('../services/projectStats')
+const treeTasks = require('../services/treeTasks')
 
 // ─── A1: Approval queue ───────────────────────────────────────────────────────
 // GET /api/admin/queue
@@ -1102,12 +1103,7 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
     const { status, project_id, assignee_id } = req.query
     let query = supabase
       .from('tasks')
-      .select(`
-        id, task_code, name, project_id, assignee_id, target_count,
-        location, priority, status, due_date, started_at, completed_at,
-        created_at, created_by, reviewed_by, review_notes, reviewed_at,
-        tree_id, captured
-      `)
+      .select('*')
       .order('created_at', { ascending: false })
       .limit(200)
 
@@ -1130,7 +1126,8 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
     // instead of three round trips back to back.
     const profileIds = [...new Set((data || []).map(t => t.assignee_id).filter(Boolean))]
     const projectIds = [...new Set((data || []).map(t => t.project_id).filter(Boolean))]
-    const treeIds    = [...new Set((data || []).map(t => t.tree_id).filter(Boolean))]
+    // The tree, plus the field capture that completed the task (its photo is the evidence).
+    const treeIds    = [...new Set((data || []).flatMap(t => [t.tree_id, t.capture_tree_id]).filter(Boolean))]
 
     const [profilesRes, projectsRes, treesRes] = await Promise.all([
       profileIds.length > 0
@@ -1141,7 +1138,7 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
         : Promise.resolve({ data: [] }),
       // The photo the field user captured lives on the linked tree record, not the task.
       treeIds.length > 0
-        ? supabase.from('tree_records').select('id, tree_id, photo_url, species, health_status, submitted_at').in('id', treeIds)
+        ? supabase.from('tree_records').select('*').in('id', treeIds)
         : Promise.resolve({ data: [] }),
     ])
 
@@ -1157,9 +1154,11 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
         ...t,
         assignee_name: profileMap[t.assignee_id] || t.assignee_id || '—',
         project_name:  projectMap[t.project_id]  || t.project_id  || '—',
-        photo_url:     treeMap[t.tree_id]?.photo_url     || null,
+        photo_url:     treeMap[t.capture_tree_id]?.photo_url || treeMap[t.tree_id]?.photo_url || null,
+        task_type:     t.task_type || 'audit',
         tree_species:  treeMap[t.tree_id]?.species       || null,
         tree_health:   treeMap[t.tree_id]?.health_status || null,
+        tree_stage:    treeMap[t.tree_id]?.stage || null,
         // Human-readable tree ID (TREE-…), same fallback the listing uses.
         tree_code:     t.tree_id ? (treeMap[t.tree_id]?.tree_id || `TREE-${String(t.tree_id).slice(0, 8).toUpperCase()}`) : null,
       }))
@@ -1466,11 +1465,7 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
     const { project_id } = req.query
     let query = supabase
       .from('tasks')
-      .select(`
-        id, task_code, name, project_id, assignee_id, target_count,
-        location, priority, status, due_date, started_at, completed_at,
-        created_at, tree_id, captured, review_notes
-      `)
+      .select('*')
       .eq('status', 'completed')
       .order('completed_at', { ascending: true })
       .limit(100)
@@ -1488,7 +1483,8 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
     // Same three-independent-lookups pattern as GET /tasks — run concurrently.
     const profileIds = [...new Set((data || []).map(t => t.assignee_id).filter(Boolean))]
     const projectIds = [...new Set((data || []).map(t => t.project_id).filter(Boolean))]
-    const treeIds    = [...new Set((data || []).map(t => t.tree_id).filter(Boolean))]
+    // The tree, plus the field capture that completed the task (its photo is the evidence).
+    const treeIds    = [...new Set((data || []).flatMap(t => [t.tree_id, t.capture_tree_id]).filter(Boolean))]
 
     const [profilesRes, projectsRes, treesRes] = await Promise.all([
       profileIds.length > 0
@@ -1515,9 +1511,11 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
         ...t,
         assignee_name: profileMap[t.assignee_id] || '—',
         project_name:  projectMap[t.project_id]  || '—',
-        photo_url:     treeMap[t.tree_id]?.photo_url     || null,
+        photo_url:     treeMap[t.capture_tree_id]?.photo_url || treeMap[t.tree_id]?.photo_url || null,
+        task_type:     t.task_type || 'audit',
         tree_species:  treeMap[t.tree_id]?.species       || null,
         tree_health:   treeMap[t.tree_id]?.health_status || null,
+        tree_stage:    treeMap[t.tree_id]?.stage || null,
         // Human-readable tree ID (TREE-…), same fallback the listing uses.
         tree_code:     t.tree_id ? (treeMap[t.tree_id]?.tree_id || `TREE-${String(t.tree_id).slice(0, 8).toUpperCase()}`) : null,
       }))
@@ -1535,7 +1533,7 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, asyn
 
     const { data: task } = await supabase
       .from('tasks')
-      .select('assignee_id, name, task_code, tree_id, project_id')
+      .select('*')
       .eq('id', id)
       .single()
 
@@ -1552,6 +1550,22 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, asyn
       .eq('id', id)
 
     if (error) throw error
+
+    // A planting task only proves the tree is in the ground: the tree becomes
+    // Planted and its audit task opens. The ledger waits for the audit.
+    if (treeTasks.typeOf(task) === treeTasks.PLANTING) {
+      const auditTask = task.tree_id ? await treeTasks.onPlantingApproved(task, req.reviewerId) : null
+      if (task.assignee_id) {
+        await createNotification({
+          userId: task.assignee_id,
+          type:   'task_approved',
+          title:  'Planting approved ✅',
+          body:   `Your planting task "${task.name}" (${task.task_code || id.slice(0, 8)}) has been approved.`,
+          link:   '/app/tasks',
+        })
+      }
+      return res.json({ success: true, planted: true, auditTask })
+    }
 
     // Approval is the verification moment — publish the capture to the ledger.
     const ledger = await publishCaptureToLedger({
