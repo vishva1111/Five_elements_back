@@ -18,6 +18,9 @@ const {
   requireAdmin,
   requireAdminOrPartner,
 } = require('../services/adminHelpers')
+const { partnerScope } = require('../services/partnerHelpers')
+const { syncProjectStats, syncAllProjectStats } = require('../services/projectStats')
+const treeTasks = require('../services/treeTasks')
 
 // ─── A1: Approval queue ───────────────────────────────────────────────────────
 // GET /api/admin/queue
@@ -184,6 +187,7 @@ router.post('/evidence/:id/approve', requireAdmin, async (req, res) => {
 
     // Update evidence status
     await supabase.from('evidence_files').update({ status: 'approved' }).eq('id', id)
+    if (projectId) await syncProjectStats([projectId])
 
     // Update submission status
     await supabase
@@ -955,6 +959,7 @@ router.post('/ledger/:id/supersede', requireAdmin, async (req, res) => {
       .from('ledger_entries')
       .update({ superseded_by: newEntry.id })
       .eq('id', id)
+    if (orig.project_id) await syncProjectStats([orig.project_id])
 
     res.json({ success: true, newEntryId: newEntry.id })
   } catch (err) {
@@ -1067,23 +1072,51 @@ router.patch('/config/settings', requireAdmin, async (req, res) => {
 // ─── Task Management (Admin) ──────────────────────────────────────────────────
 
 // GET /api/admin/tasks — list all tasks with filters
+// ── Partner scope for tasks ──────────────────────────────────────────────────
+// Admins see every task; a partner only ever touches tasks on their own projects.
+async function taskInPartnerScope(req, res, next) {
+  if (req.role !== 'partner') return next()
+  try {
+    const { projectIds } = await partnerScope(req.userId)
+    let projectId = req.body?.project_id
+    if (req.params.id) {
+      const { data: task } = await supabase.from('tasks').select('project_id').eq('id', req.params.id).maybeSingle()
+      if (!task) return res.status(404).json({ error: 'Task not found' })
+      projectId = task.project_id
+      // Moving a task to another project must stay inside the partner's projects too.
+      if (req.body?.project_id && !projectIds.includes(req.body.project_id)) {
+        return res.status(403).json({ error: 'That project is not one of yours' })
+      }
+    }
+    if (!projectId || !projectIds.includes(projectId)) {
+      if (req.params.id) return res.status(404).json({ error: 'Task not found' })
+      return res.status(projectId ? 403 : 400).json({ error: projectId ? 'That project is not one of yours' : 'Choose one of your projects for this task' })
+    }
+    next()
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+}
+
 router.get('/tasks', requireAdminOrPartner, async (req, res) => {
   try {
     const { status, project_id, assignee_id } = req.query
     let query = supabase
       .from('tasks')
-      .select(`
-        id, task_code, name, project_id, assignee_id, target_count,
-        location, priority, status, due_date, started_at, completed_at,
-        created_at, created_by, reviewed_by, review_notes, reviewed_at,
-        tree_id, captured
-      `)
+      .select('*')
       .order('created_at', { ascending: false })
       .limit(200)
 
     if (status)      query = query.eq('status', status)
     if (project_id)  query = query.eq('project_id', project_id)
     if (assignee_id) query = query.eq('assignee_id', assignee_id)
+
+    // A partner works on their own projects only — never another partner's tasks.
+    if (req.role === 'partner') {
+      const { projectIds } = await partnerScope(req.userId)
+      if (projectIds.length === 0) return res.json({ tasks: [] })
+      query = query.in('project_id', projectIds)
+    }
 
     const { data, error } = await query
     if (error) throw error
@@ -1093,7 +1126,8 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
     // instead of three round trips back to back.
     const profileIds = [...new Set((data || []).map(t => t.assignee_id).filter(Boolean))]
     const projectIds = [...new Set((data || []).map(t => t.project_id).filter(Boolean))]
-    const treeIds    = [...new Set((data || []).map(t => t.tree_id).filter(Boolean))]
+    // The tree, plus the field capture that completed the task (its photo is the evidence).
+    const treeIds    = [...new Set((data || []).flatMap(t => [t.tree_id, t.capture_tree_id]).filter(Boolean))]
 
     const [profilesRes, projectsRes, treesRes] = await Promise.all([
       profileIds.length > 0
@@ -1104,7 +1138,7 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
         : Promise.resolve({ data: [] }),
       // The photo the field user captured lives on the linked tree record, not the task.
       treeIds.length > 0
-        ? supabase.from('tree_records').select('id, photo_url, species, health_status, submitted_at').in('id', treeIds)
+        ? supabase.from('tree_records').select('*').in('id', treeIds)
         : Promise.resolve({ data: [] }),
     ])
 
@@ -1120,9 +1154,13 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
         ...t,
         assignee_name: profileMap[t.assignee_id] || t.assignee_id || '—',
         project_name:  projectMap[t.project_id]  || t.project_id  || '—',
-        photo_url:     treeMap[t.tree_id]?.photo_url     || null,
+        photo_url:     treeMap[t.capture_tree_id]?.photo_url || treeMap[t.tree_id]?.photo_url || null,
+        task_type:     t.task_type || 'audit',
         tree_species:  treeMap[t.tree_id]?.species       || null,
         tree_health:   treeMap[t.tree_id]?.health_status || null,
+        tree_stage:    treeMap[t.tree_id]?.stage || null,
+        // Human-readable tree ID (TREE-…), same fallback the listing uses.
+        tree_code:     t.tree_id ? (treeMap[t.tree_id]?.tree_id || `TREE-${String(t.tree_id).slice(0, 8).toUpperCase()}`) : null,
       }))
     })
   } catch (err) {
@@ -1132,7 +1170,7 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
 
 // POST /api/admin/tasks — create a new task
 // Body: { name, project_id, assignee_id, tree_id?, target_count, location, priority, due_date }
-router.post('/tasks', requireAdminOrPartner, async (req, res) => {
+router.post('/tasks', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { name, project_id, assignee_id, tree_id, target_count, location, priority, due_date } = req.body
 
@@ -1210,7 +1248,7 @@ router.post('/tasks', requireAdminOrPartner, async (req, res) => {
 // PUT /api/admin/tasks/:id — update task (reassign, change priority, etc.)
 // Unlike POST /tasks, assignee_id here is NOT restricted to Admin/Partner — this is also
 // how a ticket gets handed off to the real TreeApp field/individual user who'll do the work.
-router.put('/tasks/:id', requireAdminOrPartner, async (req, res) => {
+router.put('/tasks/:id', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { id } = req.params
     const { name, project_id, assignee_id, target_count, location, priority, due_date, status } = req.body
@@ -1265,7 +1303,7 @@ router.put('/tasks/:id', requireAdminOrPartner, async (req, res) => {
 })
 
 // DELETE /api/admin/tasks/:id
-router.delete('/tasks/:id', requireAdminOrPartner, async (req, res) => {
+router.delete('/tasks/:id', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { id } = req.params
 
@@ -1339,7 +1377,7 @@ router.get('/tasks/assignable-users', requireAdminOrPartner, async (req, res) =>
 // POST /api/admin/tasks/bulk-generate — create one task per tree in a project.
 // Body: { project_id, assignee_id, priority? }
 // Skips trees that already have a task (safe to call repeatedly / incrementally).
-router.post('/tasks/bulk-generate', requireAdminOrPartner, async (req, res) => {
+router.post('/tasks/bulk-generate', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { project_id, assignee_id, priority } = req.body
     if (!project_id || !assignee_id) {
@@ -1361,7 +1399,7 @@ router.post('/tasks/bulk-generate', requireAdminOrPartner, async (req, res) => {
 
     const { data: trees, error: treeErr } = await supabase
       .from('tree_records')
-      .select('id, species, latitude, longitude')
+      .select('id, tree_id, species, latitude, longitude')
       .eq('project_id', project_id)
     if (treeErr) throw treeErr
 
@@ -1378,7 +1416,7 @@ router.post('/tasks/bulk-generate', requireAdminOrPartner, async (req, res) => {
     for (const tree of toCreate) {
       const { data: codeData } = await supabase.rpc('generate_task_code', { p_tree_id: tree.id })
       const { error: insErr } = await supabase.from('tasks').insert({
-        name:         `Tree Survey — ${tree.species || 'Unknown species'} (${tree.id.slice(0, 8).toUpperCase()})`,
+        name:         `Tree Survey — ${tree.species || 'Unknown species'} (${tree.tree_id || tree.id.slice(0, 8).toUpperCase()})`,
         project_id,
         assignee_id,
         tree_id:      tree.id,
@@ -1427,16 +1465,17 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
     const { project_id } = req.query
     let query = supabase
       .from('tasks')
-      .select(`
-        id, task_code, name, project_id, assignee_id, target_count,
-        location, priority, status, due_date, started_at, completed_at,
-        created_at, tree_id, captured, review_notes
-      `)
+      .select('*')
       .eq('status', 'completed')
       .order('completed_at', { ascending: true })
       .limit(100)
 
     if (project_id) query = query.eq('project_id', project_id)
+    if (req.role === 'partner') {
+      const { projectIds } = await partnerScope(req.userId)
+      if (projectIds.length === 0) return res.json({ tasks: [] })
+      query = query.in('project_id', projectIds)
+    }
 
     const { data, error } = await query
     if (error) throw error
@@ -1444,7 +1483,8 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
     // Same three-independent-lookups pattern as GET /tasks — run concurrently.
     const profileIds = [...new Set((data || []).map(t => t.assignee_id).filter(Boolean))]
     const projectIds = [...new Set((data || []).map(t => t.project_id).filter(Boolean))]
-    const treeIds    = [...new Set((data || []).map(t => t.tree_id).filter(Boolean))]
+    // The tree, plus the field capture that completed the task (its photo is the evidence).
+    const treeIds    = [...new Set((data || []).flatMap(t => [t.tree_id, t.capture_tree_id]).filter(Boolean))]
 
     const [profilesRes, projectsRes, treesRes] = await Promise.all([
       profileIds.length > 0
@@ -1455,7 +1495,7 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
         : Promise.resolve({ data: [] }),
       // The photo the field user captured lives on the linked tree record, not the task.
       treeIds.length > 0
-        ? supabase.from('tree_records').select('id, photo_url, species, health_status').in('id', treeIds)
+        ? supabase.from('tree_records').select('id, tree_id, photo_url, species, health_status').in('id', treeIds)
         : Promise.resolve({ data: [] }),
     ])
 
@@ -1471,9 +1511,13 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
         ...t,
         assignee_name: profileMap[t.assignee_id] || '—',
         project_name:  projectMap[t.project_id]  || '—',
-        photo_url:     treeMap[t.tree_id]?.photo_url     || null,
+        photo_url:     treeMap[t.capture_tree_id]?.photo_url || treeMap[t.tree_id]?.photo_url || null,
+        task_type:     t.task_type || 'audit',
         tree_species:  treeMap[t.tree_id]?.species       || null,
         tree_health:   treeMap[t.tree_id]?.health_status || null,
+        tree_stage:    treeMap[t.tree_id]?.stage || null,
+        // Human-readable tree ID (TREE-…), same fallback the listing uses.
+        tree_code:     t.tree_id ? (treeMap[t.tree_id]?.tree_id || `TREE-${String(t.tree_id).slice(0, 8).toUpperCase()}`) : null,
       }))
     })
   } catch (err) {
@@ -1482,14 +1526,14 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
 })
 
 // PUT /api/admin/tasks/:id/approve
-router.put('/tasks/:id/approve', requireAdminOrPartner, async (req, res) => {
+router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { id } = req.params
     const { review_notes } = req.body
 
     const { data: task } = await supabase
       .from('tasks')
-      .select('assignee_id, name, task_code, tree_id, project_id')
+      .select('*')
       .eq('id', id)
       .single()
 
@@ -1506,6 +1550,22 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, async (req, res) => {
       .eq('id', id)
 
     if (error) throw error
+
+    // A planting task only proves the tree is in the ground: the tree becomes
+    // Planted and its audit task opens. The ledger waits for the audit.
+    if (treeTasks.typeOf(task) === treeTasks.PLANTING) {
+      const auditTask = task.tree_id ? await treeTasks.onPlantingApproved(task, req.reviewerId) : null
+      if (task.assignee_id) {
+        await createNotification({
+          userId: task.assignee_id,
+          type:   'task_approved',
+          title:  'Planting approved ✅',
+          body:   `Your planting task "${task.name}" (${task.task_code || id.slice(0, 8)}) has been approved.`,
+          link:   '/app/tasks',
+        })
+      }
+      return res.json({ success: true, planted: true, auditTask })
+    }
 
     // Approval is the verification moment — publish the capture to the ledger.
     const ledger = await publishCaptureToLedger({
@@ -1538,7 +1598,7 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, async (req, res) => {
 })
 
 // PUT /api/admin/tasks/:id/reject
-router.put('/tasks/:id/reject', requireAdminOrPartner, async (req, res) => {
+router.put('/tasks/:id/reject', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { id } = req.params
     const { review_notes } = req.body

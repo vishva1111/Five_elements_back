@@ -1,0 +1,146 @@
+[
+  {
+    "id": "proj-g02",
+    "name": "Western Ghats Agroforestry",
+    "funded_trees": 3200,
+    "funders_count": 18,
+    "tco2e": 1840,
+    "evidence_count": 6,
+    "last_evidence_date": null
+  },
+  {
+    "id": "proj-g03",
+    "name": "Chilika Wetland Buffer Planting",
+    "funded_trees": 900,
+    "funders_count": 9,
+    "tco2e": 805,
+    "evidence_count": 4,
+    "last_evidence_date": null
+  },
+  {
+    "id": "proj-g04",
+    "name": "Deccan Plateau Dryland Restoration",
+    "funded_trees": 5400,
+    "funders_count": 31,
+    "tco2e": 2760,
+    "evidence_count": 9,
+    "last_evidence_date": null
+  },
+  {
+    "id": "proj-g05",
+    "name": "Himalayan Foothill Corridor",
+    "funded_trees": 1100,
+    "funders_count": 2,
+    "tco2e": 1495,
+    "evidence_count": 3,
+    "last_evidence_date": null
+  },
+  {
+    "id": "proj-g06",
+    "name": "Thar Desert Edge Greening",
+    "funded_trees": 2800,
+    "funders_count": 4,
+    "tco2e": 3450,
+    "evidence_count": 5,
+    "last_evidence_date": null
+  },
+  {
+    "id": "ahmedabad-urban-canopy",
+    "name": "Ahmedabad Urban Canopy — Phase 1",
+    "funded_trees": 3330,
+    "funders_count": 110,
+    "tco2e": 84.02,
+    "evidence_count": 24,
+    "last_evidence_date": "1 Oct 2026"
+  },
+  {
+    "id": "aravalli-dryland-forest",
+    "name": "Aravalli Dryland Forest",
+    "funded_trees": 1272,
+    "funders_count": 199,
+    "tco2e": 46.07,
+    "evidence_count": 96,
+    "last_evidence_date": "10 Jul 2026"
+  },
+  {
+    "id": "nilgiris-shola-restoration",
+    "name": "Nilgiris Shola Restoration",
+    "funded_trees": 447,
+    "funders_count": 57,
+    "tco2e": 9.62,
+    "evidence_count": 12,
+    "last_evidence_date": "1 Jul 2026"
+  },
+  {
+    "id": "western-ghats-shade-canopy",
+    "name": "Western Ghats Shade Canopy",
+    "funded_trees": 78,
+    "funders_count": 151,
+    "tco2e": 1.34,
+    "evidence_count": 88,
+    "last_evidence_date": "5 Jul 2026"
+  },
+  {
+    "id": "sundarbans-mangrove-belt",
+    "name": "Sundarbans Tree Belt",
+    "funded_trees": 5460,
+    "funders_count": 312,
+    "tco2e": 108.4,
+    "evidence_count": 142,
+    "last_evidence_date": "15 Jul 2026"
+  },
+  {
+    "id": "bhopal-community-grove",
+    "name": "Bhopal Community Grove",
+    "funded_trees": 430,
+    "funders_count": 142,
+    "tco2e": 19.31,
+    "evidence_count": 24,
+    "last_evidence_date": "8 Jul 2026"
+  },
+  {
+    "id": "proj-001",
+    "name": "Sundarbans Mangrove Restoration",
+    "funded_trees": 1200,
+    "funders_count": 0,
+    "tco2e": 240.5,
+    "evidence_count": 0,
+    "last_evidence_date": null
+  },
+  {
+    "id": "proj-002",
+    "name": "Rajasthan Dryland Afforestation",
+    "funded_trees": 3400,
+    "funders_count": 0,
+    "tco2e": 510,
+    "evidence_count": 0,
+    "last_evidence_date": null
+  },
+  {
+    "id": "proj-003",
+    "name": "Western Ghats Biodiversity Corridor",
+    "funded_trees": 800,
+    "funders_count": 0,
+    "tco2e": 160,
+    "evidence_count": 0,
+    "last_evidence_date": null
+  },
+  {
+    "id": "proj-004",
+    "name": "Himalayan Watershed Reforestation",
+    "funded_trees": 0,
+    "funders_count": 0,
+    "tco2e": 0,
+    "evidence_count": 0,
+    "last_evidence_date": null
+  },
+  {
+    "id": "proj-005",
+    "name": "Kerala Agroforestry Programme",
+    "funded_trees": 2100,
+    "funders_count": 0,
+    "tco2e": 315,
+    "evidence_count": 0,
+    "last_evidence_date": null
+  }
+]

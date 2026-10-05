@@ -262,8 +262,10 @@ function formatFileSize(bytes) {
  * Best-effort: failing to create a task must never fail the tree write that
  * triggered it. Returns the tasks actually created.
  */
-async function autoCreateVerificationTasks({ trees, projectId, partnerUserId, ownerRole }) {
-  if (!['business', 'individual'].includes(ownerRole)) return []
+async function autoCreateVerificationTasks({ trees, projectId, partnerUserId, ownerRole, anyOwner = false, taskType = null }) {
+  // `anyOwner` — the tree reached the Planted stage, which needs a field check
+  // whoever it was recorded for.
+  if (!anyOwner && !['business', 'individual'].includes(ownerRole)) return []
   if (!trees || trees.length === 0) return []
 
   const created = []
@@ -272,20 +274,20 @@ async function autoCreateVerificationTasks({ trees, projectId, partnerUserId, ow
     try {
       const { data: codeRow } = await supabase.rpc('generate_task_code', { p_tree_id: tree.id })
 
-      const location = Number.isFinite(tree.latitude) && Number.isFinite(tree.longitude)
-        ? `${tree.latitude.toFixed(6)}, ${tree.longitude.toFixed(6)}`
-        : null
-
       const { data: task, error } = await supabase
         .from('tasks')
         .insert({
-          name:         `Tree Survey — ${tree.species || 'Unknown species'} (${tree.id.slice(0, 8).toUpperCase()})`,
+          name:         `${taskType === 'planting' ? 'Plant' : 'Tree Survey'} — ${tree.species || 'Unknown species'} (${tree.code || tree.id.slice(0, 8).toUpperCase()})`,
+          // planting | audit — only sent once the column exists (see services/treeTasks.js).
+          ...(taskType ? { task_type: taskType } : {}),
           project_id:   projectId,
           assignee_id:  partnerUserId,   // placeholder until reassigned to a Field Operator
           tree_id:      tree.id,
           task_code:    codeRow || null,
           target_count: 1,
-          location,
+          // Stays empty until the field operator completes the task — the app
+          // records where they actually were (same rule as bulk-generate).
+          location:     null,
           priority:     'medium',
           status:       'assigned',
           captured:     0,
@@ -308,8 +310,10 @@ async function autoCreateVerificationTasks({ trees, projectId, partnerUserId, ow
     await createNotification({
       userId: partnerUserId,
       type:   'task_assigned',
-      title:  `${created.length} verification task${created.length > 1 ? 's' : ''} created`,
-      body:   `Field verification ${created.length > 1 ? 'tasks were' : 'task was'} auto-created for the tree data you just recorded. Assign ${created.length > 1 ? 'them' : 'it'} to a Field Operator from Team.`,
+      title:  `${created.length} ${taskType === 'planting' ? 'planting' : 'audit'} task${created.length > 1 ? 's' : ''} created`,
+      body:   taskType === 'planting'
+        ? `${created.length > 1 ? 'Planting tasks were' : 'A planting task was'} created for the trees you just added. Assign ${created.length > 1 ? 'them' : 'it'} to a field operator in Tasks.`
+        : `${created.length > 1 ? 'Audit tasks were' : 'An audit task was'} created for trees that are now planted. Assign ${created.length > 1 ? 'them' : 'it'} to a field operator in Tasks.`,
       link:   '/partner/tasks',
     }).catch(() => {})
   }

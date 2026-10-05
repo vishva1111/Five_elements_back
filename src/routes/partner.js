@@ -34,12 +34,24 @@ const sheetUpload = multer({
   limits: { fileSize: 10 * 1024 * 1024, files: 1 },
 })
 
+// Business KYC documents (GST certificate, PAN card, …): PDFs or images.
+const businessDocUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 5 },
+  fileFilter: (req, file, cb) => {
+    const ok = /^(application\/pdf|image\/(png|jpe?g|webp))$/.test(file.mimetype)
+    cb(ok ? null : new Error('Only PDF, PNG, JPG or WEBP files are allowed'), ok)
+  },
+})
+
 const { createNotification } = require('./notifications')
 const { sendAccountCreatedEmail } = require('../services/emailService')
-const { withSignedUrls } = require('../services/evidenceUrls')
+const { withSignedUrls, signEvidencePath, BUCKET: EVIDENCE_BUCKET } = require('../services/evidenceUrls')
 const { parseTreeSheet, templateCsv, MAX_ROWS } = require('../services/treeImport')
 const { parseDonorSheet, templateCsv: donorTemplateCsv } = require('../services/donorImport')
 const { recordFunding } = require('../services/funding')
+const { syncProjectStats } = require('../services/projectStats')
+const treeTasks = require('../services/treeTasks')
 const { listAllAuthUsers } = require('../services/authUsers')
 const {
   generateTempPassword,
@@ -226,7 +238,7 @@ router.get('/dashboard', requirePartner, async (req, res) => {
         : Promise.resolve({ data: [] }),
       // Delivered quantity — approved evidence only (P2-03, PG-05).
       projectIds.length
-        ? supabase.from('ledger_entries').select('project_id, trees_verified').in('project_id', projectIds)
+        ? supabase.from('ledger_entries').select('project_id, trees_verified').in('project_id', projectIds).is('superseded_by', null)
         : Promise.resolve({ data: [] }),
       // Field activity feed — who captured what, most recent first.
       projectIds.length
@@ -402,6 +414,27 @@ router.get('/projects', requirePartner, async (req, res) => {
 
     const approvedAtMap = Object.fromEntries((subs || []).map(s => [s.project_id, s.submitted_at]))
 
+    // Trees recorded / planted in each project (one record = one tree; older
+    // records may carry a quantity). Paged — PostgREST caps a request at 1000 rows.
+    const recorded = {}
+    const planted  = {}
+    const pids = (projects || []).map(p => p.id)
+    const withStage = await hasStageColumn()
+    for (let from = 0; pids.length > 0; from += 1000) {
+      const { data: rows, error: rowsErr } = await supabase
+        .from('tree_records')
+        .select('project_id, quantity' + (withStage ? ', stage' : ''))
+        .in('project_id', pids)
+        .range(from, from + 999)
+      if (rowsErr) throw rowsErr
+      for (const r of rows || []) {
+        const q = Number(r.quantity) || 1
+        recorded[r.project_id] = (recorded[r.project_id] || 0) + q
+        if (withStage && r.stage && r.stage !== 'Under plantation') planted[r.project_id] = (planted[r.project_id] || 0) + q
+      }
+      if (!rows || rows.length < 1000) break
+    }
+
     const result = (projects || []).map(p => ({
       id:              p.id,
       name:            p.name,
@@ -411,6 +444,8 @@ router.get('/projects', requirePartner, async (req, res) => {
       description:     p.description,
       totalTrees:      p.total_trees,
       fundedTrees:     p.funded_trees,
+      treesRecorded:   recorded[p.id] || 0,
+      treesPlanted:    planted[p.id] || 0,
       progressPct:     p.total_trees > 0 ? Math.min(100, Math.round((p.funded_trees / p.total_trees) * 100)) : 0,
       tco2e:           p.tco2e,
       evidenceCount:   p.evidence_count,
@@ -626,7 +661,7 @@ router.get('/funders', requirePartner, async (req, res) => {
         .order('funded_at', { ascending: false }),
       // Funded vs delivered vs outstanding — delivered counts approved evidence
       // only, the same rule every other surface uses (P8-02, PG-05).
-      supabase.from('ledger_entries').select('trees_verified').in('project_id', projectIds),
+      supabase.from('ledger_entries').select('trees_verified').in('project_id', projectIds).is('superseded_by', null),
     ])
 
     if (error) throw error
@@ -725,12 +760,7 @@ router.patch('/funders/:id', requirePartner, async (req, res) => {
     const { error } = await supabase.from('individual_fundings').update(updates).eq('id', existing.id)
     if (error) throw error
 
-    if (treeDelta !== 0) {
-      const { data: project } = await supabase.from('projects').select('funded_trees').eq('id', existing.project_id).maybeSingle()
-      await supabase.from('projects')
-        .update({ funded_trees: Math.max(0, (project?.funded_trees || 0) + treeDelta), updated_at: new Date().toISOString() })
-        .eq('id', existing.project_id)
-    }
+    if (treeDelta !== 0) await syncProjectStats([existing.project_id])
 
     res.json({ success: true })
   } catch (err) {
@@ -740,7 +770,7 @@ router.patch('/funders/:id', requirePartner, async (req, res) => {
 })
 
 // ── DELETE /api/partner/funders/:id — remove a wrongly-entered donation ─────
-// Reverses projects.funded_trees / funders_count. Deliberately does NOT touch
+// projects.funded_trees / funders_count are recomputed afterwards. Deliberately does NOT touch
 // the matching ledger_entries row: individual_fundings.ledger_entry_id is a
 // uuid column but ledger_entries.id is text ("ORD-..."), so the two were never
 // actually linkable at write time — and the ledger is the platform's public,
@@ -763,14 +793,7 @@ router.delete('/funders/:id', requirePartner, async (req, res) => {
     const { error } = await supabase.from('individual_fundings').delete().eq('id', existing.id)
     if (error) throw error
 
-    const { data: project } = await supabase.from('projects').select('funded_trees, funders_count').eq('id', existing.project_id).maybeSingle()
-    if (project) {
-      await supabase.from('projects').update({
-        funded_trees:  Math.max(0, (project.funded_trees || 0) - (existing.trees_funded || 0)),
-        funders_count: Math.max(0, (project.funders_count || 0) - 1),
-        updated_at:    new Date().toISOString(),
-      }).eq('id', existing.project_id)
-    }
+    await syncProjectStats([existing.project_id])
 
     res.json({ success: true })
   } catch (err) {
@@ -821,6 +844,9 @@ router.get('/team', requirePartner, async (req, res) => {
     }
     const projectNameMap = Object.fromEntries((projsRes.data || []).map(p => [p.id, p.name]))
 
+    const businessEmails = [...new Set((data || []).filter(m => m.role === 'business').map(m => String(m.email || '').toLowerCase()))]
+    const businessMap = await businessDetailsFor(profile.id, businessEmails)
+
     const members = (data || []).map(m => {
       const authId = m.user_id || byEmail[String(m.email || '').toLowerCase()] || null
       return {
@@ -836,6 +862,7 @@ router.get('/team', requirePartner, async (req, res) => {
         projectId:    m.project_id || null,
         projectName:  m.project_id ? (projectNameMap[m.project_id] || m.project_id) : null,
         tempPassword: m.temp_password || null,
+        business:     m.role === 'business' ? (businessMap[String(m.email || '').toLowerCase()] || null) : null,
       }
     })
 
@@ -845,6 +872,58 @@ router.get('/team', requirePartner, async (req, res) => {
     res.status(500).json({ error: 'Failed to load team' })
   }
 })
+
+
+// ── Business KYC (GST / PAN / address / documents) ───────────────────────────
+// Stored in business_details (migration 007_business_details.sql), keyed by
+// partner + email because one Business user can have a team row per project.
+const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/
+const PAN_RE   = /^[A-Z]{5}[0-9]{4}[A-Z]$/
+
+/** Normalises and validates business details; returns { value } or { error }. */
+function parseBusinessDetails(body, { required }) {
+  const gst     = String(body.gst_number || '').toUpperCase().replace(/\s+/g, '')
+  const pan     = String(body.pan_number || '').toUpperCase().replace(/\s+/g, '')
+  const address = String(body.address || '').trim()
+
+  if (required) {
+    if (!gst)     return { error: 'GST number is required for a Business user' }
+    if (!pan)     return { error: 'PAN number is required for a Business user' }
+    if (!address) return { error: 'Address is required for a Business user' }
+  }
+  if (gst && !GSTIN_RE.test(gst)) return { error: 'GST number must be a valid 15-character GSTIN (e.g. 24ABCDE1234F1Z5)' }
+  if (pan && !PAN_RE.test(pan))   return { error: 'PAN number must be 10 characters (e.g. ABCDE1234F)' }
+  // A GSTIN embeds the PAN at characters 3–12.
+  if (gst && pan && gst.slice(2, 12) !== pan) return { error: 'PAN does not match the PAN inside the GST number' }
+
+  return { value: { gst_number: gst || null, pan_number: pan || null, address: address || null } }
+}
+
+async function businessDetailsTableReady() {
+  const { error } = await supabase.from('business_details').select('id').limit(1)
+  return !error
+}
+
+async function businessDetailsFor(partnerId, emails) {
+  if (emails.length === 0) return {}
+  const { data, error } = await supabase
+    .from('business_details')
+    .select('email, gst_number, pan_number, address, documents')
+    .eq('partner_id', partnerId)
+    .in('email', emails)
+  if (error) return {}
+  const out = {}
+  for (const row of data || []) {
+    const docs = await Promise.all((row.documents || []).map(async d => ({
+      name: d.name, size: d.size, type: d.type, uploadedAt: d.uploadedAt, path: d.path,
+      url: await signEvidencePath(d.path),
+    })))
+    out[String(row.email).toLowerCase()] = {
+      gstNumber: row.gst_number, panNumber: row.pan_number, address: row.address, documents: docs,
+    }
+  }
+  return out
+}
 
 // ── POST /api/partner/team/invite ─────────────────────────────────────────────
 router.post('/team/invite', requirePartner, async (req, res) => {
@@ -892,6 +971,17 @@ router.post('/team/invite', requirePartner, async (req, res) => {
     }
 
     const email = String(rawEmail).toLowerCase().trim()
+
+    // Business users carry GST / PAN / address — checked before any account is made.
+    let business = null
+    if (role === 'business') {
+      const parsed = parseBusinessDetails(req.body, { required: true })
+      if (parsed.error) return res.status(400).json({ error: parsed.error })
+      if (!(await businessDetailsTableReady())) {
+        return res.status(400).json({ error: 'Business details are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
+      }
+      business = parsed.value
+    }
 
     const { data: profile } = await supabase
       .from('partner_profiles')
@@ -962,7 +1052,7 @@ router.post('/team/invite', requirePartner, async (req, res) => {
         auth_id:        authUser.id,
         display_name:   displayName,
         name:           displayName,
-        type:           'Individual',   // profiles_type_check allows Individual | Business
+        type:           role === 'business' ? 'Business' : 'Individual',   // profiles_type_check allows Individual | Business
         location:       '',
         avatar:         '',
         trees:          0,
@@ -1054,6 +1144,14 @@ router.post('/team/invite', requirePartner, async (req, res) => {
       throw error
     }
 
+    // ── 3b. Business KYC details. ───────────────────────────────────────────
+    if (business) {
+      const { error: bizErr } = await supabase
+        .from('business_details')
+        .upsert({ partner_id: profile.id, email, ...business, updated_at: new Date().toISOString() }, { onConflict: 'partner_id,email' })
+      if (bizErr) console.error('[partner/team/invite] business details not saved:', bizErr.message)
+    }
+
     // ── 4. Tell them. ───────────────────────────────────────────────────────
     if (tempPassword) {
       await sendAccountCreatedEmail({
@@ -1088,6 +1186,113 @@ router.post('/team/invite', requirePartner, async (req, res) => {
   } catch (err) {
     console.error('[partner/team/invite]', err)
     res.status(500).json({ error: 'Failed to send invite' })
+  }
+})
+
+
+// ── PUT /api/partner/team/:id/business — update GST / PAN / address ──────────
+router.put('/team/:id/business', requirePartner, async (req, res) => {
+  try {
+    const profile = await partnerProfileFor(req.userId)
+    if (!profile) return res.status(404).json({ error: 'Partner profile not found' })
+    const member = await memberInOrg(profile.id, req.params.id)
+    if (!member || member.role !== 'business') return res.status(404).json({ error: 'Business user not found' })
+
+    const parsed = parseBusinessDetails(req.body, { required: true })
+    if (parsed.error) return res.status(400).json({ error: parsed.error })
+
+    const { error } = await supabase
+      .from('business_details')
+      .upsert({ partner_id: profile.id, email: String(member.email).toLowerCase(), ...parsed.value, updated_at: new Date().toISOString() }, { onConflict: 'partner_id,email' })
+    if (error) {
+      if (error.code === '42P01') return res.status(400).json({ error: 'Business details are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
+      throw error
+    }
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[partner/team/:id/business PUT]', err)
+    res.status(500).json({ error: err.message || 'Failed to save business details' })
+  }
+})
+
+// ── POST /api/partner/team/:id/documents — optional KYC documents ────────────
+router.post('/team/:id/documents', requirePartner, (req, res, next) => {
+  businessDocUpload.array('files', 5)(req, res, err => {
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Each file must be 10 MB or smaller' : err.message })
+    next()
+  })
+}, async (req, res) => {
+  try {
+    const profile = await partnerProfileFor(req.userId)
+    if (!profile) return res.status(404).json({ error: 'Partner profile not found' })
+    const member = await memberInOrg(profile.id, req.params.id)
+    if (!member || member.role !== 'business') return res.status(404).json({ error: 'Business user not found' })
+    if (!req.files?.length) return res.status(400).json({ error: 'Choose at least one file' })
+
+    const email = String(member.email).toLowerCase()
+    const { data: existing, error: readErr } = await supabase
+      .from('business_details')
+      .select('documents')
+      .eq('partner_id', profile.id)
+      .eq('email', email)
+      .maybeSingle()
+    if (readErr) {
+      if (readErr.code === '42P01') return res.status(400).json({ error: 'Business details are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
+      throw readErr
+    }
+
+    const uploaded = []
+    for (const f of req.files) {
+      const safe = f.originalname.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(-80)
+      const path = `business-docs/${profile.id}/${email.replace(/[^a-z0-9]+/g, '_')}/${Date.now()}_${safe}`
+      const { error: upErr } = await supabase.storage.from(EVIDENCE_BUCKET).upload(path, f.buffer, { contentType: f.mimetype, upsert: false })
+      if (upErr) return res.status(500).json({ error: `Upload failed for ${f.originalname}: ${upErr.message}` })
+      uploaded.push({ name: f.originalname, path, size: f.size, type: f.mimetype, uploadedAt: new Date().toISOString() })
+    }
+
+    const documents = [...(existing?.documents || []), ...uploaded]
+    const { error } = await supabase
+      .from('business_details')
+      .upsert({ partner_id: profile.id, email, documents, updated_at: new Date().toISOString() }, { onConflict: 'partner_id,email' })
+    if (error) throw error
+
+    res.status(201).json({ uploaded: uploaded.length })
+  } catch (err) {
+    console.error('[partner/team/:id/documents POST]', err)
+    res.status(500).json({ error: err.message || 'Failed to upload documents' })
+  }
+})
+
+// ── DELETE /api/partner/team/:id/documents?path=… — remove one document ──────
+router.delete('/team/:id/documents', requirePartner, async (req, res) => {
+  try {
+    const profile = await partnerProfileFor(req.userId)
+    if (!profile) return res.status(404).json({ error: 'Partner profile not found' })
+    const member = await memberInOrg(profile.id, req.params.id)
+    if (!member || member.role !== 'business') return res.status(404).json({ error: 'Business user not found' })
+
+    const email = String(member.email).toLowerCase()
+    const target = String(req.query.path || '')
+    const { data: existing } = await supabase
+      .from('business_details')
+      .select('documents')
+      .eq('partner_id', profile.id)
+      .eq('email', email)
+      .maybeSingle()
+    const docs = existing?.documents || []
+    if (!docs.some(d => d.path === target)) return res.status(404).json({ error: 'Document not found' })
+
+    await supabase.storage.from(EVIDENCE_BUCKET).remove([target])
+    const { error } = await supabase
+      .from('business_details')
+      .update({ documents: docs.filter(d => d.path !== target), updated_at: new Date().toISOString() })
+      .eq('partner_id', profile.id)
+      .eq('email', email)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[partner/team/:id/documents DELETE]', err)
+    res.status(500).json({ error: err.message || 'Failed to remove document' })
   }
 })
 
@@ -1419,6 +1624,134 @@ router.get('/team-users', requirePartner, async (req, res) => {
 // Accepts multipart (with an optional photo) or plain JSON.
 // partnerOwnedUserIds is imported above, alongside the other partner helpers.
 
+// ── Tree species reference (Action listing / Add trees) ─────────────────────
+// Served from the tree_species table (migration 006_tree_species.sql). Until
+// that table exists, the same built-in list is served so the console still works.
+const DEFAULT_TREE_SPECIES = [
+  ['Teak', 'Tectona grandis L.', 46], ['Mahogany', 'Swietenia macrophylla', 40],
+  ['Khaya', 'Khaya senegalensis', 36], ['Seesam', 'Dalbergia latifolia', 35],
+  ['Arjun Sadad', 'Terminalia arjuna', 30], ['Rain Tree', 'Samanea saman', 28.8],
+  ['Vad', 'Ficus benghalensis', 28], ['Baheda', 'Terminalia bellirica', 28],
+  ['Jackfruit', 'Artocarpus heterophyllus', 25], ['Siras', 'Albizia lebbeck', 22.5],
+  ['Aamba', 'Mangifera indica', 22], ['Piplo', 'Ficus religiosa', 21.5],
+  ['Amla', 'Phyllanthus emblica', 20], ['Jamun', 'Syzygium cumini', 20],
+  ['Acacia', 'Acacia auriculiformis', 20], ['Kigelia (Sausage Tree)', 'Kigelia africana', 20],
+  ['Saag', 'Tectona grandis', 19], ['Mahua', 'Madhuca longifolia', 18],
+  ['Biyo', 'Pterocarpus marsupium', 17], ['Flame of the Forest', 'Butea monosperma', 15],
+  ['Gunda', 'Cordia dichotoma', 15], ['Neem', 'Azadirachta indica', 14.3],
+  ['Moringa', 'Moringa oleifera', 12.2], ['Cassia', 'Cassia javanica', 12],
+  ['Guava', 'Psidium guajava', 10], ['Sindoor', 'Bixa orellana', 10],
+  ['Tecoma', 'Tecoma stans', 6],
+].map(([name, scientific, co2PerYear]) => ({ id: null, name, scientific, co2PerYear, isDefault: true }))
+
+const speciesRow = (r) => ({
+  id:         r.id,
+  name:       r.name,
+  scientific: r.scientific_name || '',
+  co2PerYear: Number(r.co2_per_year),
+  isDefault:  !!r.is_default,
+})
+
+// GET /api/partner/species — the full list, highest CO₂ first.
+router.get('/species', requirePartner, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('tree_species')
+      .select('id, name, scientific_name, co2_per_year, is_default')
+      .order('co2_per_year', { ascending: false })
+    if (error) {
+      console.warn('[partner/species] tree_species missing — run the setup SQL in Supabase:', error.message)
+      return res.json({ species: DEFAULT_TREE_SPECIES, persisted: false })
+    }
+    res.json({ species: (data || []).map(speciesRow), persisted: true })
+  } catch (err) {
+    console.error('[partner/species GET]', err)
+    res.status(500).json({ error: 'Failed to load species' })
+  }
+})
+
+// POST /api/partner/species — add a species that is not in the list yet.
+router.post('/species', requirePartner, async (req, res) => {
+  try {
+    const name       = String(req.body?.name || '').trim()
+    const scientific = String(req.body?.scientific || '').trim()
+    const co2        = Number(req.body?.co2PerYear)
+    if (!name) return res.status(400).json({ error: 'Common name is required' })
+    if (!Number.isFinite(co2) || co2 < 0) return res.status(400).json({ error: 'CO₂ kg/year must be a number' })
+
+    const { data, error } = await supabase
+      .from('tree_species')
+      .insert({ name, scientific_name: scientific || null, co2_per_year: co2, created_by: req.userId })
+      .select('id, name, scientific_name, co2_per_year, is_default')
+      .single()
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'This species is already in the list' })
+      if (error.code === '42P01') return res.status(503).json({ error: 'Species are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
+      throw error
+    }
+    res.status(201).json({ species: speciesRow(data) })
+  } catch (err) {
+    console.error('[partner/species POST]', err)
+    res.status(500).json({ error: err.message || 'Failed to add species' })
+  }
+})
+
+// Tree lifecycle stages the partner can set (Assign action form / edit).
+const TREE_STAGES = ['Under plantation', 'Planted']
+
+// Flow: tree added (Under plantation) → planting task → field operator plants it
+// → partner approves → Planted → audit task → field operator surveys it →
+// partner approves (ledger) or rejects (redo). Stages from Planted on need the audit.
+const TASK_STAGES = ['Planted']
+
+/** Audit task for a planted tree, unless it already has one (see services/treeTasks.js). */
+const ensureVerificationTask = (treeId, partnerUserId) => treeTasks.ensureAuditTask(treeId, partnerUserId)
+
+// `stage`, `team_member_id` and `assigned_to` come from migration 005_tree_stage.sql.
+// Until it has been run, keep everything working without them instead of
+// failing every request.
+const columnChecks = {}
+function hasTreeColumn(col) {
+  if (!columnChecks[col]) {
+    columnChecks[col] = supabase.from('tree_records').select(col).limit(1)
+      .then(({ error }) => {
+        if (error) {
+          console.warn(`[partner/trees] tree_records.${col} missing — run the setup SQL in Supabase`)
+          delete columnChecks[col] // look again next time, the migration may have been run since
+          return false
+        }
+        return true
+      })
+  }
+  return columnChecks[col]
+}
+const hasStageColumn    = () => hasTreeColumn('stage')
+const hasAssignedColumn = () => hasTreeColumn('assigned_to')
+
+// Who the tree was recorded for, kept on the row itself (see migration 005).
+async function assignmentFields(member) {
+  if (!member || !(await hasAssignedColumn())) return {}
+  return {
+    team_member_id: member.id,
+    assigned_to:    member.name || member.email || null,
+  }
+}
+
+// Human-readable ID, same "TREE-" style the field app uses.
+// Several are minted in one request (one per tree), so this is fully random:
+// 7 characters from 36 → ~78 billion combinations.
+const TREE_CODE_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+function newTreeCode() {
+  const bytes = require('crypto').randomBytes(7)
+  let code = ''
+  for (const b of bytes) code += TREE_CODE_ALPHABET[b % 36]
+  return `TREE-${code}`
+}
+
+// One record per physical tree — each gets its own Tree ID and, once planted,
+// its own verification task. Capped so a typo can't create a runaway batch.
+const MAX_TREES_PER_ENTRY = 500
+
 // ── GET /api/partner/trees — list, for the partner's own people/projects ────
 router.get('/trees', requirePartner, async (req, res) => {
   try {
@@ -1430,9 +1763,12 @@ router.get('/trees', requirePartner, async (req, res) => {
     const { projectIds } = await partnerScope(req.userId)
     if (projectIds.length === 0) return res.json({ trees: [] })
 
+    const [withStage, withAssigned] = await Promise.all([hasStageColumn(), hasAssignedColumn()])
     let query = supabase
       .from('tree_records')
-      .select('id, species, scientific_name, quantity, event_type, health_status, tree_condition, latitude, longitude, photo_url, notes, project_id, user_id, surveyor, submitted_at')
+      .select('id, tree_id, species, scientific_name, quantity, event_type, health_status, tree_condition, latitude, longitude, photo_url, notes, project_id, user_id, surveyor, submitted_at, survey_date'
+        + (withStage ? ', stage' : '')
+        + (withAssigned ? ', assigned_to, team_member_id' : ''))
       .in('user_id', userIds)
       .in('project_id', projectIds)
       .order('submitted_at', { ascending: false })
@@ -1441,8 +1777,11 @@ router.get('/trees', requirePartner, async (req, res) => {
     if (req.query.project_id) query = query.eq('project_id', req.query.project_id)
     if (req.query.user_id)    query = query.eq('user_id', req.query.user_id)
 
-    const { data, error } = await query
+    const { data: rawTrees, error } = await query
     if (error) throw error
+    // A field-app capture that completed a task is evidence for its tree, not a tree of its own.
+    const captures = await treeTasks.captureTreeIds()
+    const data = (rawTrees || []).filter(t => !captures.has(t.id))
 
     const uniqueUserIds = [...new Set((data || []).map(t => t.user_id))]
     const uniqueProjectIds = [...new Set((data || []).map(t => t.project_id))]
@@ -1454,15 +1793,33 @@ router.get('/trees', requirePartner, async (req, res) => {
         ? supabase.from('projects').select('id, name').in('id', uniqueProjectIds)
         : Promise.resolve({ data: [] }),
       // So the list can show "task pending" / "verified" without a second round trip per row.
-      supabase.from('tasks').select('id, tree_id, status').in('tree_id', (data || []).map(t => t.id)),
+      treeTasks.tasksForTrees((data || []).map(t => t.id)),
     ])
     const nameMap    = Object.fromEntries((namesRes.data || []).map(p => [p.auth_id, p.display_name]))
     const projectMap = Object.fromEntries((projectsRes.data || []).map(p => [p.id, p.name]))
-    const taskMap     = Object.fromEntries((tasksRes.data || []).map(t => [t.tree_id, t]))
+    // The task that matters right now: planting while under plantation, audit after.
+    const taskMap = {}
+    for (const t of data || []) {
+      const slot = tasksRes[t.id] || {}
+      const planted = t.stage && t.stage !== 'Under plantation'
+      taskMap[t.id] = planted ? (slot.audit || null) : (slot.planting || (withStage ? null : slot.audit) || null)
+    }
+    // Names of the field operators on those tasks, and the captures that completed them.
+    const currentTasks = Object.values(taskMap).filter(Boolean)
+    const assigneeIds = [...new Set(currentTasks.map(t => t.assignee_id).filter(Boolean))]
+    const captureIds  = [...new Set(currentTasks.map(t => t.capture_tree_id).filter(Boolean))]
+    const [assigneesRes, capturesRes] = await Promise.all([
+      assigneeIds.length ? supabase.from('profiles').select('auth_id, display_name').in('auth_id', assigneeIds) : Promise.resolve({ data: [] }),
+      captureIds.length  ? supabase.from('tree_records').select('id, photo_url').in('id', captureIds)            : Promise.resolve({ data: [] }),
+    ])
+    const assigneeNames = Object.fromEntries((assigneesRes.data || []).map(p => [p.auth_id, p.display_name]))
+    const capturesById  = Object.fromEntries((capturesRes.data || []).map(c => [c.id, c]))
 
     res.json({
       trees: (data || []).map(t => ({
         id:              t.id,
+        treeCode:        t.tree_id || `TREE-${String(t.id).slice(0, 8).toUpperCase()}`,
+        stage:           t.stage || 'Under plantation',
         species:         t.species,
         scientificName:  t.scientific_name,
         quantity:        t.quantity || 1,
@@ -1476,11 +1833,24 @@ router.get('/trees', requirePartner, async (req, res) => {
         projectId:       t.project_id,
         projectName:     projectMap[t.project_id] || t.project_id,
         userId:          t.user_id,
-        recordedFor:     nameMap[t.user_id] || '—',
+        recordedFor:     t.assigned_to || nameMap[t.user_id] || '—',
+        teamMemberId:    t.team_member_id || null,
+        // Older records (before assignments were stored) sit on the partner's own
+        // account with nobody named — those can still be given their real person.
+        canSetAssignee:  withAssigned && !t.assigned_to && t.user_id === req.userId,
         surveyor:        t.surveyor,
         submittedAt:     t.submitted_at,
+        surveyDate:      t.survey_date,
         taskStatus:      taskMap[t.id]?.status || null,
         taskId:          taskMap[t.id]?.id || null,
+        taskType:        taskMap[t.id] ? treeTasks.typeOf(taskMap[t.id]) : null,
+        taskAssigneeId:  taskMap[t.id]?.assignee_id || null,
+        taskAssignee:    taskMap[t.id] ? (assigneeNames[taskMap[t.id].assignee_id] || null) : null,
+        // The field capture that completed the task: its photo + where it was taken.
+        capturePhoto:    taskMap[t.id]?.capture_tree_id ? (capturesById[taskMap[t.id].capture_tree_id]?.photo_url || null) : null,
+        captureLocation: taskMap[t.id]?.location || null,
+        // Auto-created tasks start on the partner as a placeholder until a Field Operator is picked.
+        taskNeedsAssignee: !!taskMap[t.id] && taskMap[t.id].status === 'assigned' && taskMap[t.id].assignee_id === taskMap[t.id].created_by,
       })),
     })
   } catch (err) {
@@ -1504,11 +1874,13 @@ router.get('/trees/:id', requirePartner, async (req, res) => {
       return res.status(404).json({ error: 'Tree record not found' })
     }
 
-    const [{ data: project }, { data: owner }, { data: task }] = await Promise.all([
+    const [{ data: project }, { data: owner }, taskSlots] = await Promise.all([
       supabase.from('projects').select('id, name').eq('id', tree.project_id).maybeSingle(),
       supabase.from('profiles').select('display_name').eq('auth_id', tree.user_id).maybeSingle(),
-      supabase.from('tasks').select('id, task_code, status, assignee_id').eq('tree_id', tree.id).maybeSingle(),
+      treeTasks.tasksForTrees([tree.id]),
     ])
+    const slot = taskSlots[tree.id] || {}
+    const task = slot.audit || slot.planting || null
 
     res.json({
       tree: {
@@ -1517,6 +1889,8 @@ router.get('/trees/:id', requirePartner, async (req, res) => {
         recordedFor: owner?.display_name || '—',
       },
       task: task || null,
+      plantingTask: slot.planting || null,
+      auditTask:    slot.audit || null,
     })
   } catch (err) {
     console.error('[partner/trees/:id GET]', err)
@@ -1532,7 +1906,7 @@ router.get('/trees/:id', requirePartner, async (req, res) => {
 // (P6-04): a correction is a new record, never a silent rewrite of identity.
 const TREE_EDITABLE_FIELDS = [
   'species', 'scientific_name', 'quantity', 'event_type', 'health_status',
-  'tree_condition', 'land_type', 'dbh_cm', 'height_m', 'notes',
+  'tree_condition', 'land_type', 'dbh_cm', 'height_m', 'notes', 'survey_date',
 ]
 
 router.patch('/trees/:id', requirePartner, async (req, res) => {
@@ -1550,13 +1924,16 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
 
     // A record already folded into the ledger is done — the platform's public
     // record should not be quietly rewritten after the fact.
-    const { data: linkedTask } = await supabase
-      .from('tasks')
-      .select('status')
-      .eq('tree_id', existing.id)
-      .maybeSingle()
+    const linkedTask = (await treeTasks.tasksForTrees([existing.id]))[existing.id]?.audit || null
     if (linkedTask?.status === 'approved') {
       return res.status(409).json({ error: 'This record has already been verified and is on the ledger — it can no longer be edited.' })
+    }
+    // Planting is one-way: once a tree has left "Under plantation" it never goes back.
+    if (req.body.stage === 'Under plantation' && (await hasStageColumn())) {
+      const { data: current } = await supabase.from('tree_records').select('stage').eq('id', existing.id).maybeSingle()
+      if (current?.stage && current.stage !== 'Under plantation') {
+        return res.status(409).json({ error: 'This tree is already planted — it cannot go back to "Under plantation".' })
+      }
     }
 
     const updates = {}
@@ -1564,6 +1941,32 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
       if (req.body[field] === undefined) continue
       const val = req.body[field]
       updates[field] = (val === '' ? null : val)
+    }
+    if (req.body.team_member_id) {
+      if (!(await hasAssignedColumn())) return res.status(400).json({ error: 'Assignments are not set up in the database yet.' })
+      const { data: cur } = await supabase.from('tree_records').select('assigned_to, user_id').eq('id', existing.id).maybeSingle()
+      if (cur?.assigned_to || cur?.user_id !== req.userId) {
+        return res.status(409).json({ error: 'This tree already belongs to someone — the owner cannot be changed here.' })
+      }
+      const profile = await partnerProfileFor(req.userId)
+      const member = profile ? await memberInOrg(profile.id, req.body.team_member_id) : null
+      if (!member) return res.status(400).json({ error: 'That person is not on your team' })
+      Object.assign(updates, await assignmentFields(member))
+    }
+    if (req.body.stage !== undefined) {
+      if (!TREE_STAGES.includes(req.body.stage)) return res.status(400).json({ error: 'Unknown stage' })
+      if (!(await hasStageColumn())) {
+        return res.status(400).json({ error: 'Stages are not set up in the database yet — run the setup SQL in Supabase, then restart the backend.' })
+      }
+      updates.stage = req.body.stage
+      // A tree only becomes Planted when a field operator has planted it and the
+      // partner confirmed it (planting task) — not by changing the stage here.
+      if (TASK_STAGES.includes(req.body.stage) && (await treeTasks.hasTaskTypeColumns())) {
+        const { data: cur } = await supabase.from('tree_records').select('stage').eq('id', existing.id).maybeSingle()
+        if (!cur?.stage || cur.stage === 'Under plantation') {
+          return res.status(409).json({ error: 'Assign a field operator to plant this tree first — it becomes Planted when you confirm their planting in Tasks.' })
+        }
+      }
     }
     if (updates.species === null) return res.status(400).json({ error: 'Species cannot be empty' })
     if (updates.quantity !== undefined) {
@@ -1576,7 +1979,12 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
     const { error } = await supabase.from('tree_records').update(updates).eq('id', existing.id)
     if (error) throw error
 
-    res.json({ success: true })
+    let taskCreated = null
+    if (updates.stage && TASK_STAGES.includes(updates.stage)) {
+      taskCreated = await ensureVerificationTask(existing.id, req.userId)
+    }
+
+    res.json({ success: true, taskCreated })
   } catch (err) {
     console.error('[partner/trees/:id PATCH]', err)
     res.status(500).json({ error: 'Failed to update tree record' })
@@ -1589,6 +1997,55 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
 // once the record is gone there's nothing left to verify. An approved task means
 // the record already reached the ledger, so both stay: undoing them here would
 // silently corrupt the public record the ledger promises to be trustworthy.
+// ── POST /api/partner/trees/assign-planting — send trees to a field operator ─
+// Body: { tree_ids: string[], assignee_id }. Each tree's planting task (created
+// if missing) goes to that field operator; the tree stays "Under plantation"
+// until the partner confirms the planting in Tasks.
+router.post('/trees/assign-planting', requirePartner, async (req, res) => {
+  try {
+    const treeIds = Array.isArray(req.body?.tree_ids) ? req.body.tree_ids.filter(Boolean) : []
+    const assigneeId = req.body?.assignee_id
+    if (treeIds.length === 0) return res.status(400).json({ error: 'Choose at least one tree' })
+    if (!assigneeId) return res.status(400).json({ error: 'Choose a field operator' })
+    if (!(await treeTasks.hasTaskTypeColumns())) {
+      return res.status(400).json({ error: 'Planting tasks are not set up in the database yet — run the setup SQL in Supabase.' })
+    }
+
+    const { data: person } = await supabase.from('profiles').select('auth_id, display_name').eq('auth_id', assigneeId).maybeSingle()
+    if (!person) return res.status(400).json({ error: 'That field operator does not exist' })
+
+    const { userIds } = await partnerOwnedUserIds(req.userId)
+    const { data: trees } = await supabase.from('tree_records').select('id, user_id, tree_id, stage').in('id', treeIds)
+    const mine = (trees || []).filter(t => userIds.includes(t.user_id))
+    if (mine.length === 0) return res.status(404).json({ error: 'Tree record not found' })
+    const planted = mine.filter(t => t.stage && t.stage !== 'Under plantation')
+    if (planted.length > 0) {
+      return res.status(409).json({ error: `${planted.map(t => t.tree_id || t.id.slice(0, 8)).join(', ')} ${planted.length === 1 ? 'is' : 'are'} already planted.` })
+    }
+
+    const assigned = []
+    for (const t of mine) {
+      const task = await treeTasks.assignPlantingTask(t.id, assigneeId, req.userId)
+      if (task) assigned.push(task)
+    }
+
+    if (assigned.length > 0) {
+      await createNotification({
+        userId: assigneeId,
+        type:   'task_assigned',
+        title:  assigned.length === 1 ? `Planting task assigned: ${assigned[0].name}` : `${assigned.length} planting tasks assigned to you`,
+        body:   'Plant the tree, then capture it in the app to complete the task.',
+        link:   '/app/tasks',
+      }).catch(() => {})
+    }
+
+    res.json({ assigned: assigned.length, assignee: person.display_name, tasks: assigned })
+  } catch (err) {
+    console.error('[partner/trees/assign-planting]', err)
+    res.status(500).json({ error: err.message || 'Failed to assign planting' })
+  }
+})
+
 router.delete('/trees/:id', requirePartner, async (req, res) => {
   try {
     const { userIds } = await partnerOwnedUserIds(req.userId)
@@ -1602,18 +2059,14 @@ router.delete('/trees/:id', requirePartner, async (req, res) => {
       return res.status(404).json({ error: 'Tree record not found' })
     }
 
-    const { data: linkedTask } = await supabase
-      .from('tasks')
-      .select('id, status')
-      .eq('tree_id', existing.id)
-      .maybeSingle()
-
-    if (linkedTask?.status === 'approved') {
+    const slot = (await treeTasks.tasksForTrees([existing.id]))[existing.id] || { all: [] }
+    if (slot.audit?.status === 'approved') {
       return res.status(409).json({ error: 'This record has already been verified and is on the ledger — it can no longer be deleted.' })
     }
 
+    const linkedTask = slot.all.length > 0
     if (linkedTask) {
-      await supabase.from('tasks').delete().eq('id', linkedTask.id)
+      await supabase.from('tasks').delete().in('id', slot.all.map(t => t.id))
     }
 
     const { error } = await supabase.from('tree_records').delete().eq('id', existing.id)
@@ -1732,10 +2185,11 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
       latitude,
       longitude,
       species,
+      tree_id:      newTreeCode(),
       photo_url:    photoUrl,
       health_status: b.health_status || 'healthy',
       event_type:   b.event_type || 'Planting',
-      quantity:     num(b.quantity) || 1,
+      quantity:     1,
       notes:        b.notes ? String(b.notes).trim() : null,
       scientific_name: b.scientific_name ? String(b.scientific_name).trim() : null,
       dbh_cm:       num(b.dbh_cm),
@@ -1755,28 +2209,52 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
     const payload = Object.fromEntries(
       Object.entries(record).filter(([, v]) => v !== null && v !== undefined && v !== '')
     )
+    if (await hasStageColumn()) {
+      payload.stage = TREE_STAGES.includes(b.stage) ? b.stage : 'Under plantation'
+    }
+    Object.assign(payload, await assignmentFields(member))
 
-    const { data, error } = await supabase
+    // "Quantity 5" means five trees: five records, five Tree IDs.
+    const count = Math.max(1, Math.floor(Number(b.quantity) || 1))
+    if (count > MAX_TREES_PER_ENTRY) {
+      return res.status(400).json({ error: `Add at most ${MAX_TREES_PER_ENTRY} trees at a time — use the spreadsheet import for more.` })
+    }
+    const rows = Array.from({ length: count }, () => ({ ...payload, tree_id: newTreeCode() }))
+
+    const { data: inserted, error } = await supabase
       .from('tree_records')
-      .insert(payload)
-      .select('id, species, quantity, project_id, user_id')
-      .single()
+      .insert(rows)
+      .select('id, tree_id, species, quantity, project_id, user_id')
 
     if (error) throw error
+    const data = inserted[0]
 
     // Bridges Tree Data -> Automatic Task Creation -> Field Operator in the
     // Super Admin / Partner / Business-Individual-User flow.
-    const tasksCreated = await autoCreateVerificationTasks({
-      trees: [{ id: data.id, species: data.species, latitude, longitude }],
-      projectId,
-      partnerUserId,
-      ownerRole: member.role,
-    })
+    // With stages, the verification task appears once the tree is planted —
+    // not while it is still under plantation. Without the stage column, keep
+    // the original rule (Business/Individual owners get a task straight away).
+    const treesForTasks = inserted.map(t => ({ id: t.id, code: t.tree_id, species: t.species, latitude, longitude }))
+    // Under plantation → a planting task each; already planted → an audit task each.
+    // Without the stage column, keep the original rule.
+    const tasksCreated = payload.stage !== undefined
+      ? await treeTasks.createTreeTasks({
+          trees: treesForTasks, projectId, partnerUserId,
+          type: TASK_STAGES.includes(payload.stage) ? treeTasks.AUDIT : treeTasks.PLANTING,
+        })
+      : await autoCreateVerificationTasks({ trees: treesForTasks, projectId, partnerUserId, ownerRole: member.role })
 
+    const who = member.name || member.email
+    const codes = inserted.map(t => t.tree_id)
     res.status(201).json({
       tree: data,
-      recordedFor: member.name || member.email,
-      message: `Tree recorded for ${member.name || member.email}`,
+      trees: inserted,
+      treeCodes: codes,
+      count: inserted.length,
+      recordedFor: who,
+      message: inserted.length === 1
+        ? `Tree ${codes[0]} recorded for ${who}.`
+        : `${inserted.length} trees recorded for ${who} (${codes[0]} … ${codes[codes.length - 1]}).`,
       tasksCreated: tasksCreated.length,
       task: tasksCreated[0] || null,
     })
@@ -1879,6 +2357,12 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
       return res.status(400).json({ error: 'That file has a header row but no data rows.', summary })
     }
 
+    // Every tree becomes its own record — keep one import to a sane size.
+    const MAX_TREES_PER_IMPORT = 5000
+    if (summary.totalTrees > MAX_TREES_PER_IMPORT) {
+      return res.status(400).json({ error: `This file adds ${summary.totalTrees.toLocaleString('en-IN')} trees — import at most ${MAX_TREES_PER_IMPORT.toLocaleString('en-IN')} at a time.`, summary })
+    }
+
     if (dryRun) {
       return res.json({ dryRun: true, ok: parsed.errors.length === 0, summary })
     }
@@ -1901,7 +2385,10 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
     const now      = new Date().toISOString()
     const today    = now.slice(0, 10)
 
-    const payload = parsed.rows.map(r => {
+    const assignment = await assignmentFields(member)
+    // A row with quantity 5 becomes five records, each with its own Tree ID.
+    const expanded = parsed.rows.flatMap(r => Array.from({ length: Math.max(1, Math.floor(Number(r.quantity) || 1)) }, () => r))
+    const payload = expanded.map(r => {
       const record = {
         user_id:        resolvedImportUserId,
         project_id:     projectId,
@@ -1912,7 +2399,7 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
         health_status:  r.health_status,
         tree_condition: r.tree_condition,
         event_type:     r.event_type,
-        quantity:       r.quantity,
+        quantity:       1,
         land_type:      r.land_type,
         dbh_cm:         r.dbh_cm,
         height_m:       r.height_m,
@@ -1921,6 +2408,8 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
         survey_date:    today,
         submitted_at:   now,
         synced:         true,
+        tree_id:        newTreeCode(),
+        ...assignment,
       }
       // Several columns are NOT NULL with a default, so an explicit null is
       // rejected where omitting the key is fine.
@@ -1932,7 +2421,7 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
     const { data, error } = await supabase
       .from('tree_records')
       .insert(payload)
-      .select('id')
+      .select('id, tree_id')
 
     if (error) throw error
 
@@ -1940,12 +2429,19 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
     // Postgres preserves row order for a multi-row INSERT ... RETURNING, and
     // parsed.rows/payload/data are all built from the same ordered array, so
     // pairing by index is safe here.
-    const tasksCreated = await autoCreateVerificationTasks({
+    // Imported rows start as "Under plantation" once stages exist, so their
+    // tasks appear when each tree is marked Planted.
+    const tasksCreated = (await hasStageColumn())
+      ? await treeTasks.createTreeTasks({
+          trees: data.map((row, i) => ({ id: row.id, code: row.tree_id, species: expanded[i].species, latitude: expanded[i].latitude, longitude: expanded[i].longitude })),
+          projectId, partnerUserId, type: treeTasks.PLANTING,
+        })
+      : await autoCreateVerificationTasks({
       trees: data.map((row, i) => ({
         id:        row.id,
-        species:   parsed.rows[i].species,
-        latitude:  parsed.rows[i].latitude,
-        longitude: parsed.rows[i].longitude,
+        species:   expanded[i].species,
+        latitude:  expanded[i].latitude,
+        longitude: expanded[i].longitude,
       })),
       projectId,
       partnerUserId,
@@ -1956,7 +2452,7 @@ router.post('/trees/import', requirePartner, sheetUpload.single('file'), async (
       imported:   data.length,
       totalTrees: summary.totalTrees,
       recordedFor: summary.recordedFor,
-      message: `${data.length} record(s) imported for ${summary.recordedFor}.`,
+      message: `${data.length} tree${data.length === 1 ? '' : 's'} imported for ${summary.recordedFor}, each with its own Tree ID.`,
       tasksCreated: tasksCreated.length,
     })
   } catch (err) {
