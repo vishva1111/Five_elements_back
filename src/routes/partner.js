@@ -1755,6 +1755,7 @@ const MAX_TREES_PER_ENTRY = 500
 // ── GET /api/partner/trees — list, for the partner's own people/projects ────
 router.get('/trees', requirePartner, async (req, res) => {
   try {
+    await treeTasks.reconcileQuietly()   // re-link field-app completions to their trees
     const { userIds: ownedIds } = await partnerOwnedUserIds(req.userId)
     // Always include the partner's own auth ID so records they entered directly
     // (e.g. seeded data or records added via the partner account) are visible.
@@ -1862,6 +1863,7 @@ router.get('/trees', requirePartner, async (req, res) => {
 // ── GET /api/partner/trees/:id — one record, detail view ────────────────────
 router.get('/trees/:id', requirePartner, async (req, res) => {
   try {
+    await treeTasks.reconcileQuietly()   // re-link field-app completions to their trees
     const { userIds } = await partnerOwnedUserIds(req.userId)
     const { data: tree, error } = await supabase
       .from('tree_records')
@@ -2003,6 +2005,7 @@ router.patch('/trees/:id', requirePartner, async (req, res) => {
 // until the partner confirms the planting in Tasks.
 router.post('/trees/assign-planting', requirePartner, async (req, res) => {
   try {
+    await treeTasks.reconcileCaptureTasks({ force: true })   // act on the task as linked to its own tree
     const treeIds = Array.isArray(req.body?.tree_ids) ? req.body.tree_ids.filter(Boolean) : []
     const assigneeId = req.body?.assignee_id
     if (treeIds.length === 0) return res.status(400).json({ error: 'Choose at least one tree' })
@@ -2153,6 +2156,13 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
       return res.status(403).json({ error: 'That project is not one of your approved projects' })
     }
 
+    // "Quantity 5" means five trees: five records, five Tree IDs. Checked before
+    // the photo upload so a rejected entry doesn't leave an orphaned photo.
+    const count = Math.max(1, Math.floor(Number(b.quantity) || 1))
+    if (count > MAX_TREES_PER_ENTRY) {
+      return res.status(400).json({ error: `Add at most ${MAX_TREES_PER_ENTRY} trees at a time — use the spreadsheet import for more.` })
+    }
+
     // Optional photo.
     let photoUrl = null
     if (req.file) {
@@ -2214,11 +2224,6 @@ router.post('/trees', requirePartner, treePhotoUpload.single('photo'), async (re
     }
     Object.assign(payload, await assignmentFields(member))
 
-    // "Quantity 5" means five trees: five records, five Tree IDs.
-    const count = Math.max(1, Math.floor(Number(b.quantity) || 1))
-    if (count > MAX_TREES_PER_ENTRY) {
-      return res.status(400).json({ error: `Add at most ${MAX_TREES_PER_ENTRY} trees at a time — use the spreadsheet import for more.` })
-    }
     const rows = Array.from({ length: count }, () => ({ ...payload, tree_id: newTreeCode() }))
 
     const { data: inserted, error } = await supabase

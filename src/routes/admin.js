@@ -1176,6 +1176,7 @@ async function taskInPartnerScope(req, res, next) {
 
 router.get('/tasks', requireAdminOrPartner, async (req, res) => {
   try {
+    await treeTasks.reconcileQuietly()   // re-link field-app completions to their trees
     const { status, project_id, assignee_id } = req.query
     let query = supabase
       .from('tasks')
@@ -1544,6 +1545,7 @@ router.post('/tasks/bulk-generate', requireAdminOrPartner, taskInPartnerScope, a
 // GET /api/admin/tasks/pending-review — tasks completed by field users, awaiting review
 router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
   try {
+    await treeTasks.reconcileQuietly()   // re-link field-app completions to their trees
     const { project_id } = req.query
     let query = supabase
       .from('tasks')
@@ -1610,6 +1612,7 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
 // PUT /api/admin/tasks/:id/approve
 router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
+    await treeTasks.reconcileCaptureTasks({ force: true })   // act on the task as linked to its own tree
     const { id } = req.params
     const { review_notes } = req.body
 
@@ -1682,6 +1685,7 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, asyn
 // PUT /api/admin/tasks/:id/reject
 router.put('/tasks/:id/reject', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
+    await treeTasks.reconcileCaptureTasks({ force: true })   // act on the task as linked to its own tree
     const { id } = req.params
     const { review_notes } = req.body
 
