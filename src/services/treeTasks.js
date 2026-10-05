@@ -264,9 +264,12 @@ async function runReconcile() {
   return fixed
 }
 
-/** reconcileCaptureTasks for read paths — a repair failure must never break the page. */
-async function reconcileQuietly() {
-  try { await reconcileCaptureTasks() } catch (e) { console.error('[treeTasks] reconcile:', e.message) }
+/**
+ * reconcileCaptureTasks for read paths — a repair failure must never break the
+ * page. Pass { force: true } where a just-completed task must show at once.
+ */
+async function reconcileQuietly(opts) {
+  try { await reconcileCaptureTasks(opts) } catch (e) { console.error('[treeTasks] reconcile:', e.message) }
 }
 
 module.exports = {

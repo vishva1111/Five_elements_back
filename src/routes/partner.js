@@ -1775,7 +1775,7 @@ const MAX_TREES_PER_ENTRY = 500
 // ── GET /api/partner/trees — list, for the partner's own people/projects ────
 router.get('/trees', requirePartner, async (req, res) => {
   try {
-    await treeTasks.reconcileQuietly()   // re-link field-app completions to their trees
+    await treeTasks.reconcileQuietly({ force: true })   // Assign action: a just-completed planting must show "Review planting" now
     const { userIds: ownedIds } = await partnerOwnedUserIds(req.userId)
     // Always include the partner's own auth ID so records they entered directly
     // (e.g. seeded data or records added via the partner account) are visible.
@@ -1883,7 +1883,7 @@ router.get('/trees', requirePartner, async (req, res) => {
 // ── GET /api/partner/trees/:id — one record, detail view ────────────────────
 router.get('/trees/:id', requirePartner, async (req, res) => {
   try {
-    await treeTasks.reconcileQuietly()   // re-link field-app completions to their trees
+    await treeTasks.reconcileQuietly({ force: true })   // tree detail: same, never a stale task
     const { userIds } = await partnerOwnedUserIds(req.userId)
     const { data: tree, error } = await supabase
       .from('tree_records')
