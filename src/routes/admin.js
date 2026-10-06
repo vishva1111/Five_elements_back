@@ -23,6 +23,8 @@ const {
 const { partnerScope } = require('../services/partnerHelpers')
 const { syncProjectStats, syncAllProjectStats } = require('../services/projectStats')
 const treeTasks = require('../services/treeTasks')
+const { treeHistory, treeSummaries } = require('../services/treeHistory')
+const projectChanges = require('../services/projectChanges')
 
 // submitted_by columns hold auth ids — map them to something a reviewer can
 // read: profile display name first, then the auth account's email.
@@ -56,13 +58,14 @@ async function submitterNames(authIds) {
 router.get('/queue/count', requireAdmin, async (_req, res) => {
   try {
     const head = { count: 'exact', head: true }
-    const [ev, pr, pa] = await Promise.all([
+    const [ev, pr, pa, changes] = await Promise.all([
       supabase.from('evidence_files').select('id', head).eq('status', 'pending_review'),
       supabase.from('project_submissions').select('id', head).eq('status', 'pending_review'),
       supabase.from('partner_profiles').select('id', head).eq('status', 'pending'),
+      projectChanges.pendingChangeCount(),
     ])
     const evidence = ev.count || 0, projects = pr.count || 0, partners = pa.count || 0
-    res.json({ total: evidence + projects + partners, evidence, projects, partners })
+    res.json({ total: evidence + projects + partners + changes, evidence, projects, partners, changes })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -75,7 +78,7 @@ router.get('/queue', requireAdmin, async (req, res) => {
 
     // Three independent reads — none depends on another's result, so they run
     // concurrently instead of paying for three round trips back to back.
-    const [{ data: evidence }, { data: projects }, { data: partners }] = await Promise.all([
+    const [{ data: evidence }, { data: projects }, { data: partners }, changes] = await Promise.all([
       supabase
         .from('evidence_files')
         .select('id, submission_id, file_name, uploaded_at, project_submissions(project_id, submitted_by, title, element)')
@@ -94,6 +97,7 @@ router.get('/queue', requireAdmin, async (req, res) => {
         .eq('status', 'pending')
         .order('applied_at', { ascending: true })
         .limit(50),
+      projectChanges.listChangeRequests({ status: 'pending' }),
     ])
 
     const names = await submitterNames([
@@ -113,7 +117,6 @@ router.get('/queue', requireAdmin, async (req, res) => {
           submittedBy: nameOf(sub?.submitted_by),
           submittedAt: e.uploaded_at ? new Date(e.uploaded_at).toLocaleDateString('en-GB') : '—',
           element:     sub?.element || '',
-          priority:    'normal',
         })
       })
     }
@@ -127,7 +130,6 @@ router.get('/queue', requireAdmin, async (req, res) => {
           submittedBy: nameOf(p.submitted_by),
           submittedAt: p.submitted_at ? new Date(p.submitted_at).toLocaleDateString('en-GB') : '—',
           element:     p.element || '',
-          priority:    'normal',
         })
       })
     }
@@ -141,12 +143,104 @@ router.get('/queue', requireAdmin, async (req, res) => {
           submittedBy: p.contact_name || p.contact_email || p.user_id || '—',
           submittedAt: p.applied_at ? new Date(p.applied_at).toLocaleDateString('en-GB') : '—',
           element:     '',
-          priority:    'normal',
         })
       })
     }
 
+    // Colour / fencing / boundary changes wait here until an admin decides.
+    const CHANGE_LABEL = { color: 'Colour change', fencing: 'Fencing update', boundary: 'Boundary change (app)' }
+    ;(changes || []).forEach(c => {
+      items.push({
+        id:          c.id,
+        type:        'change',
+        source:      c.source,
+        changeType:  c.type,
+        title:       c.projectName,
+        detail:      CHANGE_LABEL[c.type] || 'Project change',
+        submittedBy: c.requestedByName || '—',
+        submittedAt: c.createdAt ? new Date(c.createdAt).toLocaleDateString('en-GB') : '—',
+        element:     '',
+      })
+    })
+
     res.json({ items })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─── Project change requests (colour / fencing / app boundary) ────────────────
+// GET /api/admin/change-requests?status=pending
+router.get('/change-requests', requireAdmin, async (req, res) => {
+  try {
+    const status = ['pending', 'approved', 'rejected'].includes(req.query.status) ? req.query.status : undefined
+    const requests = await projectChanges.listChangeRequests({ status })
+    // The reviewer compares against the project as it is now, not as it was when asked.
+    const ids = [...new Set(requests.map(r => r.projectId))]
+    const [extras, boundaries] = await Promise.all([
+      projectChanges.projectExtras(ids),
+      projectChanges.geofencesFor(ids),
+    ])
+    res.json({
+      requests: requests.map(r => ({
+        ...r,
+        live: { color: extras[r.projectId]?.mapColor || null, fencing: extras[r.projectId]?.fencing || null, boundary: boundaries[r.projectId] || null },
+      })),
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /api/admin/change-requests/:source/:id/:decision — source: project | geofence; decision: approve | reject
+router.post('/change-requests/:source/:id/:decision', requireAdmin, async (req, res) => {
+  try {
+    const { source, id, decision } = req.params
+    if (!['project', 'geofence'].includes(source)) return res.status(400).json({ error: 'Unknown request source' })
+    if (!['approve', 'reject'].includes(decision)) return res.status(400).json({ error: 'Unknown decision' })
+    const notes = String(req.body?.review_notes || '').trim() || null
+    if (decision === 'reject' && !notes) return res.status(400).json({ error: 'Say why the request is rejected' })
+
+    const table = source === 'project' ? 'project_change_requests' : 'geofence_change_requests'
+    const { data: request, error: readErr } = await supabase.from(table).select('*').eq('id', id).maybeSingle()
+    if (readErr) throw readErr
+    if (!request) return res.status(404).json({ error: 'Request not found' })
+    if (request.status !== 'pending') return res.status(409).json({ error: `This request was already ${request.status}` })
+
+    const { data: me } = await supabase.from('profiles').select('display_name').eq('auth_id', req.reviewerId).maybeSingle()
+    const reviewer = { id: req.reviewerId, name: me?.display_name || 'Admin' }
+
+    if (decision === 'approve') {
+      if (source === 'project') await projectChanges.applyProjectRequest(request, reviewer)
+      else await projectChanges.unlockBoundary(request.project_id)
+    }
+
+    const { error } = await supabase
+      .from(table)
+      .update({
+        status:           decision === 'approve' ? 'approved' : 'rejected',
+        reviewed_by:      reviewer.id,
+        reviewed_by_name: reviewer.name,
+        reviewed_at:      new Date().toISOString(),
+        review_notes:     notes,
+      })
+      .eq('id', id)
+    if (error) throw error
+
+    const what = source === 'geofence' ? 'boundary change' : request.type === 'color' ? 'colour change' : 'fencing update'
+    if (request.requested_by) {
+      await createNotification({
+        userId: request.requested_by,
+        type:   decision === 'approve' ? 'change_approved' : 'change_rejected',
+        title:  decision === 'approve' ? `Your ${what} was approved ✅` : `Your ${what} was not approved`,
+        body:   `${request.project_name || 'Your project'}: ${decision === 'approve'
+          ? (source === 'geofence' ? 'the boundary is unlocked — redraw it in the app.' : 'the change is now live.')
+          : notes}`,
+        link:   '/partner/projects',
+      }).catch(() => {})
+    }
+
+    res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -875,18 +969,28 @@ router.get('/projects', requireAdminOrPartner, async (req, res) => {
     // that don't exist on `projects` — it 500'd on every call. Fixed to match the real schema.
     const { data, error } = await supabase
       .from('projects')
-      .select('id, name, element, category, location, partner, total_trees, funded_trees, status, active, created_at')
+      .select('id, name, element, category, location, description, partner, total_trees, funded_trees, status, active, created_at')
       .order('created_at', { ascending: false })
 
     if (error) throw error
+
+    const ids = (data || []).map(p => p.id)
+    const [extras, boundaries] = await Promise.all([
+      projectChanges.projectExtras(ids),
+      projectChanges.geofencesFor(ids),
+    ])
 
     res.json({
       projects: (data || []).map(p => ({
         id:          p.id,
         title:       p.name,
+        mapColor:    extras[p.id]?.mapColor || null,
+        fencing:     extras[p.id]?.fencing || null,
+        boundary:    boundaries[p.id] || null,
         element:     p.element,
         category:    p.category,
         location:    p.location,
+        description: p.description || null,
         submittedBy: p.partner || '—',
         partnerName: p.partner || '—',
         treeCount:   p.total_trees || 0,
@@ -909,9 +1013,11 @@ router.get('/projects', requireAdminOrPartner, async (req, res) => {
 router.get('/tree-records', requireAdminOrPartner, async (req, res) => {
   try {
     const { project_id, health_status, limit } = req.query
+    // ?with=audit adds every photo, the latest audit and project names (Tree Records page).
+    const withAudit = req.query.with === 'audit'
     let query = supabase
       .from('tree_records')
-      .select('id, user_id, species, project_id, photo_url, latitude, longitude, health_status, notes, submitted_at, synced')
+      .select(withAudit ? '*' : 'id, user_id, species, project_id, photo_url, latitude, longitude, health_status, notes, submitted_at, synced')
       .order('submitted_at', { ascending: false })
       .limit(limit ? parseInt(limit, 10) : 200)
 
@@ -930,7 +1036,86 @@ router.get('/tree-records', requireAdminOrPartner, async (req, res) => {
     if (error) throw error
 
     // Field-app captures are evidence for an existing tree, not trees of their own.
-    res.json({ records: (data || []).filter(r => !captures.has(r.id)) })
+    const records = (data || []).filter(r => !captures.has(r.id))
+    if (!withAudit) return res.json({ records })
+
+    const projectIds = [...new Set(records.map(r => r.project_id).filter(Boolean))]
+    const [summaries, projectsRes, extras] = await Promise.all([
+      treeSummaries(records).catch(e => { console.error('[admin/tree-records] summaries:', e.message); return {} }),
+      projectIds.length ? supabase.from('projects').select('id, name').in('id', projectIds) : Promise.resolve({ data: [] }),
+      projectChanges.projectExtras(projectIds),
+    ])
+    const projectNames = Object.fromEntries((projectsRes.data || []).map(p => [p.id, p.name]))
+    res.json({
+      records: records.map(r => ({
+        id:            r.id,
+        tree_code:     r.tree_id || `TREE-${String(r.id).slice(0, 8).toUpperCase()}`,
+        user_id:       r.user_id,
+        species:       r.species,
+        project_id:    r.project_id,
+        project_name:  projectNames[r.project_id] || r.project_id,
+        project_color: extras[r.project_id]?.mapColor || null,
+        photo_url:     r.photo_url,
+        photo_urls:    summaries[r.id]?.photoUrls || (r.photo_url ? [r.photo_url] : []),
+        photo_count:   summaries[r.id]?.photoCount ?? (r.photo_url ? 1 : 0),
+        latitude:      r.latitude,
+        longitude:     r.longitude,
+        health_status: r.health_status,
+        tree_condition: r.tree_condition || null,
+        stage:         r.stage || null,
+        notes:         r.notes,
+        submitted_at:  r.submitted_at,
+        survey_date:   r.survey_date || null,
+        synced:        r.synced,
+        audit_count:   summaries[r.id]?.auditCount ?? 0,
+        latest_audit:  summaries[r.id]?.latestAudit || null,
+      })),
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /api/admin/tree-records/:id/history — every photo, the planting and every audit round.
+// Partners may read trees on their own projects (the task review uses this too).
+router.get('/tree-records/:id/history', requireAdminOrPartner, async (req, res) => {
+  try {
+    await treeTasks.reconcileQuietly({ force: true })
+    const { data: tree, error } = await supabase.from('tree_records').select('*').eq('id', req.params.id).maybeSingle()
+    if (error) throw error
+    if (!tree) return res.status(404).json({ error: 'Tree record not found' })
+    if (req.role === 'partner') {
+      const { projectIds } = await partnerScope(req.userId)
+      if (!projectIds.includes(tree.project_id)) return res.status(404).json({ error: 'Tree record not found' })
+    }
+    res.json(await treeHistory(tree))
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// PATCH /api/admin/projects/:id — edit a project's details (colour and fencing go through change requests)
+router.patch('/projects/:id', requireAdmin, async (req, res) => {
+  try {
+    const FIELDS = { name: 160, description: 5000, location: 300, category: 120 }
+    const updates = {}
+    for (const [key, max] of Object.entries(FIELDS)) {
+      if (req.body[key] === undefined) continue
+      const value = String(req.body[key] ?? '').trim()
+      if (value.length > max) return res.status(400).json({ error: `${key} is too long (max ${max} characters)` })
+      updates[key] = value || null
+    }
+    if (req.body.totalTrees !== undefined) {
+      const n = Number(req.body.totalTrees)
+      if (!Number.isInteger(n) || n < 0) return res.status(400).json({ error: 'Target trees must be a whole number' })
+      updates.total_trees = n
+    }
+    if ('name' in updates && !updates.name) return res.status(400).json({ error: 'Project name is required' })
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'Nothing to update' })
+    const { error } = await supabase.from('projects').update(updates).eq('id', req.params.id)
+    if (error) throw error
+    if (updates.name) await supabase.from('project_submissions').update({ title: updates.name }).eq('project_id', req.params.id)
+    res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -1254,6 +1439,23 @@ async function taskInPartnerScope(req, res, next) {
   }
 }
 
+/**
+ * Where a task is, as one number and one step:
+ * assigned 0% → in the field (captured / target) → submitted 90% → approved 100%.
+ * A task sent back for changes counts as being in the field again.
+ */
+function taskProgress(t) {
+  const target = Math.max(1, Number(t.target_count) || 1)
+  const captured = Math.max(0, Number(t.captured) || 0)
+  if (t.status === 'approved')  return { pct: 100, step: 4, label: 'Approved' }
+  if (t.status === 'completed') return { pct: 90, step: 3, label: 'Submitted for review' }
+  if (t.status === 'rejected')  return { pct: Math.min(60, Math.round((captured / target) * 60)), step: 2, label: 'Changes requested' }
+  if (t.status === 'in_progress' || captured > 0) {
+    return { pct: Math.max(10, Math.min(80, Math.round((captured / target) * 80))), step: 2, label: `In the field · ${Math.min(captured, target)}/${target}` }
+  }
+  return { pct: 0, step: 1, label: 'Assigned' }
+}
+
 router.get('/tasks', requireAdminOrPartner, async (req, res) => {
   try {
     await treeTasks.reconcileQuietly()   // re-link field-app completions to their trees
@@ -1288,7 +1490,7 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
 
     const [profilesRes, projectsRes, treesRes] = await Promise.all([
       profileIds.length > 0
-        ? supabase.from('profiles').select('auth_id, id, display_name').in('auth_id', profileIds)
+        ? supabase.from('profiles').select('auth_id, id, display_name, role, roles').in('auth_id', profileIds)
         : Promise.resolve({ data: [] }),
       projectIds.length > 0
         ? supabase.from('projects').select('id, name').in('id', projectIds)
@@ -1300,7 +1502,13 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
     ])
 
     const profileMap = {}
-    ;(profilesRes.data || []).forEach(p => { profileMap[p.auth_id] = p.display_name })
+    const roleMap = {}
+    ;(profilesRes.data || []).forEach(p => {
+      profileMap[p.auth_id] = p.display_name
+      const roles = [p.role, ...(p.roles || [])]
+      roleMap[p.auth_id] = roles.includes('field_user') || roles.includes('individual') ? 'field'
+        : roles.includes('partner') ? 'partner' : roles.includes('admin') ? 'admin' : (p.role || null)
+    })
     const projectMap = {}
     ;(projectsRes.data || []).forEach(p => { projectMap[p.id] = p.name })
     const treeMap = {}
@@ -1318,6 +1526,8 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
         tree_stage:    treeMap[t.tree_id]?.stage || null,
         // Human-readable tree ID (TREE-…), same fallback the listing uses.
         tree_code:     t.tree_id ? (treeMap[t.tree_id]?.tree_id || `TREE-${String(t.tree_id).slice(0, 8).toUpperCase()}`) : null,
+        assignee_role: roleMap[t.assignee_id] || null,
+        progress:      taskProgress(t),
       }))
     })
   } catch (err) {
@@ -1326,10 +1536,10 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
 })
 
 // POST /api/admin/tasks — create a new task
-// Body: { name, project_id, assignee_id, tree_id?, target_count, location, priority, due_date }
+// Body: { name, project_id, assignee_id, tree_id?, target_count, location, due_date }
 router.post('/tasks', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
-    const { name, project_id, assignee_id, tree_id, target_count, location, priority, due_date } = req.body
+    const { name, project_id, assignee_id, tree_id, target_count, location, due_date } = req.body
 
     if (!name || !assignee_id) {
       return res.status(400).json({ error: 'name and assignee_id are required' })
@@ -1376,7 +1586,8 @@ router.post('/tasks', requireAdminOrPartner, taskInPartnerScope, async (req, res
         task_code,
         target_count: target_count || 10,
         location:     location     || null,
-        priority:     priority     || 'medium',
+        // Priority is gone from the panel; the mobile app still reads the column.
+        priority:     'medium',
         due_date:     due_date     || null,
         status:       'assigned',
         captured:     0,
@@ -1392,7 +1603,7 @@ router.post('/tasks', requireAdminOrPartner, taskInPartnerScope, async (req, res
       userId: assignee_id,
       type:   'task_assigned',
       title:  `New task assigned: ${name}`,
-      body:   `Task ${task_code} has been assigned to you. Priority: ${priority || 'medium'}.`,
+      body:   `Task ${task_code} has been assigned to you.`,
       link:   '/app/tasks',
     })
 
@@ -1402,18 +1613,18 @@ router.post('/tasks', requireAdminOrPartner, taskInPartnerScope, async (req, res
   }
 })
 
-// PUT /api/admin/tasks/:id — update task (reassign, change priority, etc.)
+// PUT /api/admin/tasks/:id — update task (reassign, rename, due date, etc.)
 // Unlike POST /tasks, assignee_id here is NOT restricted to Admin/Partner — this is also
 // how a ticket gets handed off to the real TreeApp field/individual user who'll do the work.
 router.put('/tasks/:id', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
     const { id } = req.params
-    const { name, project_id, assignee_id, target_count, location, priority, due_date, status } = req.body
+    const { name, project_id, assignee_id, target_count, location, due_date, status } = req.body
 
     // Approval publishes to the ledger and rejection notifies the field user —
     // both have their own routes, so they can't be set by a plain edit.
     if (status === 'approved' || status === 'rejected') {
-      return res.status(400).json({ error: `Use the ${status === 'approved' ? 'approve' : 'reject'} action to review a task` })
+      return res.status(400).json({ error: `Use the ${status === 'approved' ? 'Approve' : 'Request changes'} action to review a task` })
     }
 
     let newAssigneeProfile = null
@@ -1433,7 +1644,6 @@ router.put('/tasks/:id', requireAdminOrPartner, taskInPartnerScope, async (req, 
     if (assignee_id  !== undefined) updates.assignee_id  = assignee_id
     if (target_count !== undefined) updates.target_count = target_count
     if (location     !== undefined) updates.location     = location
-    if (priority     !== undefined) updates.priority     = priority
     if (due_date     !== undefined) updates.due_date     = due_date
     if (status       !== undefined) updates.status       = status
 
@@ -1497,8 +1707,9 @@ router.delete('/tasks/:id', requireAdminOrPartner, taskInPartnerScope, async (re
 //   handing an already-created ticket off to whoever will actually go do the fieldwork.
 router.get('/tasks/assignable-users', requireAdminOrPartner, async (req, res) => {
   try {
-    const pool = req.query.pool === 'field' ? 'field' : 'admin_partner'
-    const matchRoles = pool === 'field' ? ['individual', 'field_user'] : ['admin', 'partner']
+    // ?pool=partner — partner accounts only, labelled with their organisation.
+    const pool = ['field', 'partner'].includes(req.query.pool) ? req.query.pool : 'admin_partner'
+    const matchRoles = pool === 'field' ? ['individual', 'field_user'] : pool === 'partner' ? ['partner'] : ['admin', 'partner']
 
     const { data, error } = await supabase
       .from('profiles')
@@ -1511,6 +1722,8 @@ router.get('/tasks/assignable-users', requireAdminOrPartner, async (req, res) =>
       const roles = [p.role, ...(p.roles || [])]
       return roles.some(r => matchRoles.includes(r))
     })
+    // A partner can hand work to their own account, never to another partner.
+    if (pool === 'partner' && req.role === 'partner') assignable = assignable.filter(p => p.auth_id === req.userId)
 
     // For the field pool: anyone explicitly given the field_user role is assignable
     // straight away — a partner has just created them and needs to hand them work.
@@ -1525,11 +1738,22 @@ router.get('/tasks/assignable-users', requireAdminOrPartner, async (req, res) =>
       })
     }
 
+    let orgNames = {}
+    if (pool === 'partner' && assignable.length > 0) {
+      const { data: orgs } = await supabase
+        .from('partner_profiles')
+        .select('user_id, org_name')
+        .in('user_id', assignable.map(p => p.auth_id))
+      orgNames = Object.fromEntries((orgs || []).map(o => [o.user_id, o.org_name]))
+    }
+
     res.json({
       users: assignable.map(p => ({
         auth_id:      p.auth_id,
-        display_name: p.display_name || p.auth_id,
-        role:         p.role,
+        display_name: orgNames[p.auth_id]
+          ? `${orgNames[p.auth_id]}${p.display_name ? ` (${p.display_name})` : ''}`
+          : (p.display_name || p.auth_id),
+        role:         pool === 'partner' ? 'partner' : p.role,
       }))
     })
   } catch (err) {
@@ -1538,11 +1762,11 @@ router.get('/tasks/assignable-users', requireAdminOrPartner, async (req, res) =>
 })
 
 // POST /api/admin/tasks/bulk-generate — create one task per tree in a project.
-// Body: { project_id, assignee_id, priority? }
+// Body: { project_id, assignee_id }
 // Skips trees that already have a task (safe to call repeatedly / incrementally).
 router.post('/tasks/bulk-generate', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
-    const { project_id, assignee_id, priority } = req.body
+    const { project_id, assignee_id } = req.body
     if (!project_id || !assignee_id) {
       return res.status(400).json({ error: 'project_id and assignee_id are required' })
     }
@@ -1595,7 +1819,7 @@ router.post('/tasks/bulk-generate', requireAdminOrPartner, taskInPartnerScope, a
         // coordinates. Location should reflect where the field user actually is when
         // they complete this ticket, so it stays null until the app sets it on completion.
         location:     null,
-        priority:     priority || 'medium',
+        priority:     'medium',   // still read by the mobile app
         status:       'assigned',
         captured:     0,
         created_by:   req.reviewerId,
@@ -1768,12 +1992,16 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, asyn
   }
 })
 
-// PUT /api/admin/tasks/:id/reject
-router.put('/tasks/:id/reject', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
+// PUT /api/admin/tasks/:id/request-changes  (and the older /reject, same thing)
+// Sends the submission back to the field user with what to fix. The task goes
+// to status 'rejected' because that is the value the mobile app reads to show
+// its Edit button; the user fixes it on the same task and resubmits.
+async function requestChanges(req, res) {
   try {
     await treeTasks.reconcileCaptureTasks({ force: true })   // act on the task as linked to its own tree
     const { id } = req.params
-    const { review_notes } = req.body
+    const review_notes = String(req.body?.review_notes || '').trim()
+    if (!review_notes) return res.status(400).json({ error: 'Say what needs to change' })
 
     const { data: task } = await supabase
       .from('tasks')
@@ -1788,7 +2016,7 @@ router.put('/tasks/:id/reject', requireAdminOrPartner, taskInPartnerScope, async
       .update({
         status:       'rejected',
         reviewed_by:  req.reviewerId,
-        review_notes: review_notes || null,
+        review_notes,
         reviewed_at:  new Date().toISOString(),
       })
       .eq('id', id)
@@ -1800,8 +2028,8 @@ router.put('/tasks/:id/reject', requireAdminOrPartner, taskInPartnerScope, async
       await createNotification({
         userId: task.assignee_id,
         type:   'task_rejected',
-        title:  `Task rejected ❌`,
-        body:   `Your task "${task.name}" (${task.task_code || id.slice(0,8)}) was rejected. ${review_notes || 'Please review and redo.'}`,
+        title:  `Changes requested ✏️`,
+        body:   `"${task.name}" (${task.task_code || id.slice(0,8)}) needs changes: ${review_notes}`,
         link:   '/app/tasks',
       })
     }
@@ -1810,6 +2038,8 @@ router.put('/tasks/:id/reject', requireAdminOrPartner, taskInPartnerScope, async
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
-})
+}
+router.put('/tasks/:id/request-changes', requireAdminOrPartner, taskInPartnerScope, requestChanges)
+router.put('/tasks/:id/reject',          requireAdminOrPartner, taskInPartnerScope, requestChanges)
 
 module.exports = router

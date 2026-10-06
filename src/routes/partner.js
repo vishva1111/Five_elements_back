@@ -52,6 +52,8 @@ const { parseDonorSheet, templateCsv: donorTemplateCsv } = require('../services/
 const { recordFunding } = require('../services/funding')
 const { syncProjectStats } = require('../services/projectStats')
 const treeTasks = require('../services/treeTasks')
+const { treeHistory, treeSummaries } = require('../services/treeHistory')
+const projectChanges = require('../services/projectChanges')
 const { listAllAuthUsers } = require('../services/authUsers')
 const {
   generateTempPassword,
@@ -453,7 +455,13 @@ router.get('/projects', requirePartner, async (req, res) => {
 
     const approvedAtMap = Object.fromEntries((subs || []).map(s => [s.project_id, s.submitted_at]))
 
-    const { recorded, planted } = await treeCountsByProject((projects || []).map(p => p.id))
+    const ids = (projects || []).map(p => p.id)
+    const [{ recorded, planted }, extras, boundaries, requests] = await Promise.all([
+      treeCountsByProject(ids),
+      projectChanges.projectExtras(ids),
+      projectChanges.geofencesFor(ids),
+      projectChanges.listChangeRequests({ projectIds: ids }),
+    ])
 
     const result = (projects || []).map(p => ({
       id:              p.id,
@@ -475,6 +483,11 @@ router.get('/projects', requirePartner, async (req, res) => {
       coverImage:      p.cover_image,
       lastEvidenceDate: p.last_evidence_date,
       approvedAt:      approvedAtMap[p.id] || null,
+      mapColor:        extras[p.id]?.mapColor || null,
+      fencing:         extras[p.id]?.fencing || null,
+      boundary:        boundaries[p.id] || null,
+      // Newest first: the pending ones decide which buttons the card offers.
+      changeRequests:  requests.filter(r => r.projectId === p.id).slice(0, 10),
     }))
 
     res.json({ projects: result })
@@ -519,6 +532,132 @@ router.post('/projects', requirePartner, async (req, res) => {
   } catch (err) {
     console.error('[partner/projects]', err)
     res.status(500).json({ error: 'Failed to register project' })
+  }
+})
+
+// ── PATCH /api/partner/projects/:id — edit a project's details ──────────────
+// Plain details change at once. Map colour and fencing do not: those go
+// through POST /projects/:id/change-requests and wait for an admin.
+const PROJECT_EDITABLE = {
+  name:        { column: 'name',        max: 160 },
+  description: { column: 'description', max: 5000 },
+  location:    { column: 'location',    max: 300 },
+  category:    { column: 'category',    max: 120 },
+}
+
+router.patch('/projects/:id', requirePartner, async (req, res) => {
+  try {
+    const { projectIds } = await partnerScope(req.userId)
+    if (!projectIds.includes(req.params.id)) return res.status(404).json({ error: 'Project not found' })
+
+    const updates = {}
+    for (const [key, { column, max }] of Object.entries(PROJECT_EDITABLE)) {
+      if (req.body[key] === undefined) continue
+      const value = String(req.body[key] ?? '').trim()
+      if (value.length > max) return res.status(400).json({ error: `${key} is too long (max ${max} characters)` })
+      updates[column] = value || null
+    }
+    if (req.body.totalTrees !== undefined) {
+      const n = Number(req.body.totalTrees)
+      if (!Number.isInteger(n) || n < 0) return res.status(400).json({ error: 'Target trees must be a whole number' })
+      updates.total_trees = n
+    }
+    if ('name' in updates && !updates.name) return res.status(400).json({ error: 'Project name is required' })
+    if ('location' in updates && !updates.location) return res.status(400).json({ error: 'Location is required' })
+    if (req.body.mapColor !== undefined || req.body.fencing !== undefined) {
+      return res.status(400).json({ error: 'Colour and fencing changes need admin approval — send a change request instead.' })
+    }
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'Nothing to update' })
+
+    const { error } = await supabase.from('projects').update(updates).eq('id', req.params.id)
+    if (error) throw error
+    // Keep the submission's title in step so Submissions shows the same name.
+    if (updates.name) {
+      await supabase.from('project_submissions').update({ title: updates.name })
+        .eq('project_id', req.params.id).eq('submitted_by', req.userId)
+    }
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[partner/projects PATCH]', err)
+    res.status(500).json({ error: 'Failed to update project' })
+  }
+})
+
+// ── POST /api/partner/projects/:id/change-requests — colour / fencing ───────
+// Body: { type: 'color', color: '#RRGGBB', reason? }
+//    or { type: 'fencing', fencing: {...}, coordinates?: [{latitude, longitude}], reason? }
+router.post('/projects/:id/change-requests', requirePartner, async (req, res) => {
+  try {
+    const { projectIds } = await partnerScope(req.userId)
+    if (!projectIds.includes(req.params.id)) return res.status(404).json({ error: 'Project not found' })
+
+    const type = req.body?.type
+    if (!['color', 'fencing'].includes(type)) return res.status(400).json({ error: 'Choose what to change: colour or fencing' })
+
+    const { data: project } = await supabase.from('projects').select('id, name').eq('id', req.params.id).maybeSingle()
+    if (!project) return res.status(404).json({ error: 'Project not found' })
+    const [extras, boundaries] = await Promise.all([
+      projectChanges.projectExtras([project.id]),
+      projectChanges.geofencesFor([project.id]),
+    ])
+
+    let proposed, current
+    if (type === 'color') {
+      const color = String(req.body.color || '').trim()
+      if (!projectChanges.HEX_COLOR.test(color)) return res.status(400).json({ error: 'Pick a colour' })
+      if (color.toLowerCase() === (extras[project.id]?.mapColor || '').toLowerCase()) {
+        return res.status(400).json({ error: 'That is already the project colour' })
+      }
+      proposed = { color }
+      current = { color: extras[project.id]?.mapColor || null }
+    } else {
+      const fencing = projectChanges.cleanFencing(req.body.fencing)
+      const coordinates = projectChanges.cleanCoordinates(req.body.coordinates)
+      if (coordinates.length > 0 && coordinates.length < 3) {
+        return res.status(400).json({ error: 'A boundary needs at least 3 points' })
+      }
+      if (Object.keys(fencing).length === 0 && coordinates.length === 0) {
+        return res.status(400).json({ error: 'Fill in the fencing details or draw the boundary' })
+      }
+      proposed = { fencing, ...(coordinates.length ? {
+        coordinates,
+        areaSqM: Math.round(projectChanges.polygonArea(coordinates)),
+        perimeterM: Math.round(projectChanges.polygonPerimeter(coordinates)),
+      } : {}) }
+      current = { fencing: extras[project.id]?.fencing || null, boundary: boundaries[project.id] || null }
+    }
+
+    const { data: pending, error: pendErr } = await supabase
+      .from('project_change_requests')
+      .select('id')
+      .eq('project_id', project.id).eq('type', type).eq('status', 'pending')
+      .limit(1)
+    if (pendErr) return res.status(400).json({ error: projectChanges.NEEDS_MIGRATION })
+    if (pending?.length) {
+      return res.status(409).json({ error: `A ${type === 'color' ? 'colour' : 'fencing'} change for this project is already waiting for approval` })
+    }
+
+    const { data: me } = await supabase.from('profiles').select('display_name').eq('auth_id', req.userId).maybeSingle()
+    const { data, error } = await supabase
+      .from('project_change_requests')
+      .insert({
+        project_id:        project.id,
+        project_name:      project.name,
+        type,
+        proposed,
+        current,
+        reason:            String(req.body.reason || '').trim().slice(0, 1000) || null,
+        status:            'pending',
+        requested_by:      req.userId,
+        requested_by_name: me?.display_name || null,
+      })
+      .select()
+      .single()
+    if (error) throw error
+    res.status(201).json({ request: data })
+  } catch (err) {
+    console.error('[partner/projects/:id/change-requests]', err)
+    res.status(500).json({ error: 'Failed to send the change request' })
   }
 })
 
@@ -1835,6 +1974,12 @@ router.get('/trees', requirePartner, async (req, res) => {
     ])
     const assigneeNames = Object.fromEntries((assigneesRes.data || []).map(p => [p.auth_id, p.display_name]))
     const capturesById  = Object.fromEntries((capturesRes.data || []).map(c => [c.id, c]))
+    // Every photo + the latest audit per tree, for the cards. A failure here
+    // must not break the list — the cards then just show the main photo.
+    const [summaries, extras] = await Promise.all([
+      treeSummaries(data || []).catch(e => { console.error('[partner/trees] summaries:', e.message); return {} }),
+      projectChanges.projectExtras(uniqueProjectIds),
+    ])
 
     res.json({
       trees: (data || []).map(t => ({
@@ -1872,11 +2017,33 @@ router.get('/trees', requirePartner, async (req, res) => {
         captureLocation: taskMap[t.id]?.location || null,
         // Auto-created tasks start on the partner as a placeholder until a Field Operator is picked.
         taskNeedsAssignee: !!taskMap[t.id] && taskMap[t.id].status === 'assigned' && taskMap[t.id].assignee_id === taskMap[t.id].created_by,
+        projectColor:    extras[t.project_id]?.mapColor || null,
+        photoUrls:       summaries[t.id]?.photoUrls || (t.photo_url ? [t.photo_url] : []),
+        photoCount:      summaries[t.id]?.photoCount ?? (t.photo_url ? 1 : 0),
+        auditCount:      summaries[t.id]?.auditCount ?? 0,
+        latestAudit:     summaries[t.id]?.latestAudit || null,
       })),
     })
   } catch (err) {
     console.error('[partner/trees GET]', err)
     res.status(500).json({ error: 'Failed to load trees' })
+  }
+})
+
+// ── GET /api/partner/trees/:id/history — photos, planting and every audit ───
+router.get('/trees/:id/history', requirePartner, async (req, res) => {
+  try {
+    await treeTasks.reconcileQuietly({ force: true })
+    const { userIds } = await partnerOwnedUserIds(req.userId)
+    const { projectIds } = await partnerScope(req.userId)
+    const { data: tree, error } = await supabase.from('tree_records').select('*').eq('id', req.params.id).maybeSingle()
+    if (error) throw error
+    const mine = tree && (userIds.includes(tree.user_id) || tree.user_id === req.userId || projectIds.includes(tree.project_id))
+    if (!mine) return res.status(404).json({ error: 'Tree record not found' })
+    res.json(await treeHistory(tree))
+  } catch (err) {
+    console.error('[partner/trees/:id/history]', err)
+    res.status(500).json({ error: 'Failed to load the tree history' })
   }
 })
 
