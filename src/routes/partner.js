@@ -676,6 +676,59 @@ router.post('/projects/:id/change-requests', requirePartner, async (req, res) =>
   }
 })
 
+// ── POST /api/partner/projects/:id/fencing-requests/:requestId/:decision ─────
+// The partner decides a field-app user's request to redraw the land fencing.
+// Approve reopens the boundary (draft) so the app user can walk and lock it again;
+// reject keeps it locked and the app user sees review_notes.
+router.post('/projects/:id/fencing-requests/:requestId/:decision', requirePartner, async (req, res) => {
+  try {
+    const { id, requestId, decision } = req.params
+    if (!['approve', 'reject'].includes(decision)) return res.status(400).json({ error: 'Unknown decision' })
+    const { projectIds } = await partnerScope(req.userId)
+    if (!projectIds.includes(id)) return res.status(404).json({ error: 'Project not found' })
+
+    const notes = String(req.body?.review_notes || '').trim().slice(0, 1000) || null
+    if (decision === 'reject' && !notes) return res.status(400).json({ error: 'Say why the request is rejected' })
+
+    const { data: request, error: readErr } = await supabase
+      .from('geofence_change_requests').select('*').eq('id', requestId).eq('project_id', id).maybeSingle()
+    if (readErr) throw readErr
+    if (!request) return res.status(404).json({ error: 'Request not found' })
+    if (request.status !== 'pending') return res.status(409).json({ error: `This request was already ${request.status}` })
+
+    const { data: me } = await supabase.from('profiles').select('display_name').eq('auth_id', req.userId).maybeSingle()
+    if (decision === 'approve') await projectChanges.unlockBoundary(id)
+
+    const { error } = await supabase
+      .from('geofence_change_requests')
+      .update({
+        status:           decision === 'approve' ? 'approved' : 'rejected',
+        reviewed_by:      req.userId,
+        reviewed_by_name: me?.display_name || 'Partner',
+        reviewed_at:      new Date().toISOString(),
+        review_notes:     notes,
+      })
+      .eq('id', requestId)
+    if (error) throw error
+
+    if (request.requested_by) {
+      await createNotification({
+        userId: request.requested_by,
+        type:   decision === 'approve' ? 'change_approved' : 'change_rejected',
+        title:  decision === 'approve' ? 'Your fencing update was approved ✅' : 'Your fencing update was not approved',
+        body:   `${request.project_name || 'Your project'}: ${decision === 'approve'
+          ? 'the boundary is unlocked — walk the land and lock it again in the app.'
+          : notes}`,
+        link:   '/partner/projects',
+      }).catch(() => {})
+    }
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[partner/projects fencing-requests]', err)
+    res.status(500).json({ error: 'Failed to save the decision' })
+  }
+})
+
 // ── GET /api/partner/evidence ─────────────────────────────────────────────────
 router.get('/evidence', requirePartner, async (req, res) => {
   try {
