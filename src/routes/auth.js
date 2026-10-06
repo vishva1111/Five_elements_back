@@ -305,6 +305,49 @@ router.post('/refresh', async (req, res) => {
   }
 })
 
+// ── GET /api/auth/profile ─────────────────────────────────────────────────────
+// Everything the "My profile" popup shows, in one call: the account, plus the
+// organisation for a partner. Both lookups run in parallel (the popup used to
+// wait for /me and then a separate /partner/profile round trip). The account
+// row is the one requireAuth already read, so only the organisation is fetched.
+router.get('/profile', requireAuth, async (req, res) => {
+  try {
+    const p = req.profile
+    const { data: org, error: oErr } = await supabase
+      .from('partner_profiles')
+      .select('org_name, org_type, website, contact_name, contact_email, contact_phone, address, status')
+      .eq('user_id', req.userId)
+      .maybeSingle()
+    if (oErr) throw oErr
+
+    const role = p?.role || req.role || 'individual'
+    res.json({
+      account: {
+        name:        p?.display_name || '',
+        email:       req.userEmail || '',
+        role,
+        roles:       p?.roles?.length ? p.roles : [role],
+        status:      p?.status || 'active',
+        location:    p?.location || null,
+        memberSince: p?.created_at || null,
+      },
+      organisation: org ? {
+        orgName:      org.org_name,
+        orgType:      org.org_type,
+        website:      org.website,
+        contactName:  org.contact_name,
+        contactEmail: org.contact_email,
+        contactPhone: org.contact_phone,
+        address:      org.address,
+        status:       org.status,
+      } : null,
+    })
+  } catch (err) {
+    console.error('[GET /api/auth/profile]', err)
+    res.status(500).json({ error: 'Failed to load profile' })
+  }
+})
+
 // ── POST /api/auth/first-login-done ───────────────────────────────────────────
 // The Welcome page calls this once it has been shown. Nothing cleared the flag
 // before, so every sign-in landed on Welcome again.
