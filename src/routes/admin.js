@@ -20,10 +20,16 @@ const {
   requireAdmin,
   requireAdminOrPartner,
 } = require('../services/adminHelpers')
-const { partnerScope } = require('../services/partnerHelpers')
+const { partnerScope, partnerScopeCached, clearPartnerCache } = require('../services/partnerHelpers')
+
+// Approving or rejecting a submission changes which projects are a partner's — drop the cached scope.
+router.use((req, res, next) => {
+  if (req.method !== 'GET') { clearPartnerCache(); res.on('finish', clearPartnerCache) }
+  next()
+})
 const { syncProjectStats, syncAllProjectStats } = require('../services/projectStats')
 const treeTasks = require('../services/treeTasks')
-const { treeHistory, treeSummaries } = require('../services/treeHistory')
+const { treeHistory, treeSummaries, allTasksFor } = require('../services/treeHistory')
 const projectChanges = require('../services/projectChanges')
 
 // submitted_by columns hold auth ids — map them to something a reviewer can
@@ -670,12 +676,18 @@ router.get('/submissions', requireAdmin, async (req, res) => {
 
     if (error) throw error
 
-    const names = await submitterNames((data || []).map(s => s.submitted_by))
-    const submissions = await Promise.all((data || []).map(async sub => ({
+    // Names and file links are independent; every file of every submission is signed in one call.
+    const allFiles = (data || []).flatMap(sub => sub.evidence_files || [])
+    const [names, signedFiles] = await Promise.all([
+      submitterNames((data || []).map(s => s.submitted_by)),
+      withSignedUrls(allFiles),
+    ])
+    const signedById = new Map(signedFiles.map(f => [f.id, f]))
+    const submissions = (data || []).map(sub => ({
       ...sub,
       submitted_by_name: names[sub.submitted_by] || null,
-      evidence_files: await withSignedUrls(sub.evidence_files || []),
-    })))
+      evidence_files: (sub.evidence_files || []).map(f => signedById.get(f.id) || f),
+    }))
 
     res.json({ submissions })
   } catch (err) {
@@ -1026,13 +1038,16 @@ router.get('/tree-records', requireAdminOrPartner, async (req, res) => {
 
     // A partner sees trees on their own projects only — never another partner's.
     if (req.role === 'partner') {
-      const { projectIds } = await partnerScope(req.userId)
+      const { projectIds } = await partnerScopeCached(req.userId)
       if (projectIds.length === 0) return res.json({ records: [] })
       query = query.in('project_id', projectIds)
     }
 
-    await treeTasks.reconcileQuietly()
-    const [{ data, error }, captures] = await Promise.all([query, treeTasks.captureTreeIds()])
+    // The query does not depend on reconcile; only the capture ids do.
+    const [{ data, error }, captures] = await Promise.all([
+      query,
+      treeTasks.reconcileQuietly().then(() => treeTasks.captureTreeIds()),
+    ])
     if (error) throw error
 
     // Field-app captures are evidence for an existing tree, not trees of their own.
@@ -1080,14 +1095,14 @@ router.get('/tree-records', requireAdminOrPartner, async (req, res) => {
 // Partners may read trees on their own projects (the task review uses this too).
 router.get('/tree-records/:id/history', requireAdminOrPartner, async (req, res) => {
   try {
-    await treeTasks.reconcileQuietly({ force: true })
-    const { data: tree, error } = await supabase.from('tree_records').select('*').eq('id', req.params.id).maybeSingle()
+    const [, { data: tree, error }, scope] = await Promise.all([
+      treeTasks.reconcileQuietly({ force: true }),
+      supabase.from('tree_records').select('*').eq('id', req.params.id).maybeSingle(),
+      req.role === 'partner' ? partnerScopeCached(req.userId) : Promise.resolve(null),
+    ])
     if (error) throw error
     if (!tree) return res.status(404).json({ error: 'Tree record not found' })
-    if (req.role === 'partner') {
-      const { projectIds } = await partnerScope(req.userId)
-      if (!projectIds.includes(tree.project_id)) return res.status(404).json({ error: 'Tree record not found' })
-    }
+    if (scope && !scope.projectIds.includes(tree.project_id)) return res.status(404).json({ error: 'Tree record not found' })
     res.json(await treeHistory(tree))
   } catch (err) {
     res.status(500).json({ error: err.message })
@@ -1472,7 +1487,7 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
 
     // A partner works on their own projects only — never another partner's tasks.
     if (req.role === 'partner') {
-      const { projectIds } = await partnerScope(req.userId)
+      const { projectIds } = await partnerScopeCached(req.userId)
       if (projectIds.length === 0) return res.json({ tasks: [] })
       query = query.in('project_id', projectIds)
     }
@@ -1497,7 +1512,7 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
         : Promise.resolve({ data: [] }),
       // The photo the field user captured lives on the linked tree record, not the task.
       treeIds.length > 0
-        ? supabase.from('tree_records').select('*').in('id', treeIds)
+        ? supabase.from('tree_records').select('id, tree_id, photo_url, species, health_status, stage').in('id', treeIds)
         : Promise.resolve({ data: [] }),
     ])
 
@@ -1866,7 +1881,7 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
 
     if (project_id) query = query.eq('project_id', project_id)
     if (req.role === 'partner') {
-      const { projectIds } = await partnerScope(req.userId)
+      const { projectIds } = await partnerScopeCached(req.userId)
       if (projectIds.length === 0) return res.json({ tasks: [] })
       query = query.in('project_id', projectIds)
     }

@@ -356,7 +356,28 @@ async function partnerOwnedUserIds(partnerUserId) {
   return { profile, userIds }
 }
 
+// ── Short-lived cache for read-only list pages ──────────────────────────────
+// Every partner page starts by asking "which projects / team members are mine?"
+// (2–4 database round trips). That answer changes rarely, so GET pages reuse it
+// for a few seconds. Writes never use it, and any non-GET request on the partner
+// or admin routes clears it (see the router.use hooks), so a change shows at once.
+const SCOPE_TTL_MS = 15000
+const scopeCache = new Map()
+function memo(key, load) {
+  const hit = scopeCache.get(key)
+  if (hit && Date.now() - hit.at < SCOPE_TTL_MS) return hit.promise
+  const promise = load().catch(e => { scopeCache.delete(key); throw e })
+  scopeCache.set(key, { at: Date.now(), promise })
+  return promise
+}
+const partnerScopeCached = userId => memo(`scope:${userId}`, () => partnerScope(userId))
+const partnerOwnedUserIdsCached = userId => memo(`owned:${userId}`, () => partnerOwnedUserIds(userId))
+const clearPartnerCache = () => scopeCache.clear()
+
 module.exports = {
+  partnerScopeCached,
+  partnerOwnedUserIdsCached,
+  clearPartnerCache,
   generateTempPassword,
   findOrCreateDonorAccount,
   getOrCreateOfflineDonorAccount,

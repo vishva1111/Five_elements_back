@@ -38,12 +38,15 @@ async function tasksForTrees(treeIds, columns = 'id, tree_id, status, assignee_i
   const out = Object.fromEntries(ids.map(id => [id, { planting: null, audit: null, all: [] }]))
   if (ids.length === 0) return out
   const withType = await hasTaskTypeColumns()
-  for (let i = 0; i < ids.length; i += 300) {
-    const { data, error } = await supabase
-      .from('tasks')
-      .select(columns + (withType ? ', task_type, capture_tree_id' : ''))
-      .in('tree_id', ids.slice(i, i + 300))
-      .order('created_at', { ascending: true })
+  const chunks = []
+  for (let i = 0; i < ids.length; i += 300) chunks.push(ids.slice(i, i + 300))
+  // Chunks are independent — fetch them together instead of one after another.
+  const results = await Promise.all(chunks.map(part => supabase
+    .from('tasks')
+    .select(columns + (withType ? ', task_type, capture_tree_id' : ''))
+    .in('tree_id', part)
+    .order('created_at', { ascending: true })))
+  for (const { data, error } of results) {
     if (error) throw error
     for (const t of data || []) {
       const slot = out[t.tree_id]
@@ -55,12 +58,29 @@ async function tasksForTrees(treeIds, columns = 'id, tree_id, status, assignee_i
   return out
 }
 
-/** Tree record ids that are field-app captures completing a task (not trees in their own right). */
+/** Splits already-loaded tasks (oldest first) into { planting, audit, all } like tasksForTrees. */
+function slotFor(tasks) {
+  const slot = { planting: null, audit: null, all: [] }
+  for (const t of tasks || []) { slot.all.push(t); slot[typeOf(t)] = t }
+  return slot
+}
+
+/**
+ * Tree record ids that are field-app captures completing a task (not trees in their own right).
+ * Read by almost every list, so it is kept for a few seconds; the only writer
+ * of capture_tree_id on this server is reconcile, which clears it.
+ */
+const CAPTURE_TTL_MS = 3000
+let captureCache = null
 async function captureTreeIds() {
+  if (captureCache && Date.now() - captureCache.at < CAPTURE_TTL_MS) return captureCache.value
   if (!(await hasTaskTypeColumns())) return new Set()
   const { data } = await supabase.from('tasks').select('capture_tree_id').not('capture_tree_id', 'is', null)
-  return new Set((data || []).map(r => r.capture_tree_id))
+  const value = new Set((data || []).map(r => r.capture_tree_id))
+  captureCache = { at: Date.now(), value }
+  return value
 }
+const clearCaptureCache = () => { captureCache = null }
 
 /** Creates the planting or audit task for each tree that doesn't already have one of that type. */
 async function createTreeTasks({ trees, projectId, partnerUserId, type }) {
@@ -183,6 +203,7 @@ async function assignPlantingTask(treeId, assigneeId, partnerUserId) {
 // moved back onto that tree and the capture kept as capture_tree_id.
 const TREE_CODE_RE = /\((TREE-[A-Z0-9]+)\)/
 const RECONCILE_EVERY_MS = 5000
+const FORCED_RECONCILE_MIN_MS = 1500
 let lastReconcile = 0
 let reconciling = null
 
@@ -193,7 +214,9 @@ let reconciling = null
  */
 async function reconcileCaptureTasks({ force = false } = {}) {
   if (reconciling) return reconciling
-  if (!force && Date.now() - lastReconcile < RECONCILE_EVERY_MS) return 0
+  // Even a forced run is skipped if one finished a moment ago — two page loads
+  // at once should not each re-scan every task.
+  if (Date.now() - lastReconcile < (force ? FORCED_RECONCILE_MIN_MS : RECONCILE_EVERY_MS)) return 0
   reconciling = (async () => {
     try {
       if (!(await hasTaskTypeColumns())) return 0
@@ -268,7 +291,10 @@ async function runReconcile() {
     await onPlantingApproved(task, task.reviewed_by || task.created_by)
   }
 
-  if (fixed > 0) console.log(`[treeTasks] re-linked ${fixed} field-app task(s) to their trees`)
+  if (fixed > 0) {
+    clearCaptureCache()
+    console.log(`[treeTasks] re-linked ${fixed} field-app task(s) to their trees`)
+  }
   return fixed
 }
 
@@ -284,6 +310,6 @@ module.exports = {
   reconcileCaptureTasks, reconcileQuietly,
   assignPlantingTask,
   PLANTING, AUDIT, typeOf,
-  hasTaskTypeColumns, tasksForTrees, captureTreeIds,
+  hasTaskTypeColumns, tasksForTrees, slotFor, captureTreeIds, clearCaptureCache,
   createTreeTasks, ensureAuditTask, closePlantingTask, onPlantingApproved,
 }
