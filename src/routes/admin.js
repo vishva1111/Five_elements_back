@@ -2007,16 +2007,17 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, asyn
   }
 })
 
-// PUT /api/admin/tasks/:id/request-changes  (and the older /reject, same thing)
-// Sends the submission back to the field user with what to fix. The task goes
+// PUT /api/admin/tasks/:id/reject  (also served as /request-changes, same thing)
+// Rejects the submission and sends it back to the field user with the reason. The task goes
 // to status 'rejected' because that is the value the mobile app reads to show
 // its Edit button; the user fixes it on the same task and resubmits.
-async function requestChanges(req, res) {
+const rejectTask = requireNote => async (req, res) => {
   try {
     await treeTasks.reconcileCaptureTasks({ force: true })   // act on the task as linked to its own tree
     const { id } = req.params
     const review_notes = String(req.body?.review_notes || '').trim()
-    if (!review_notes) return res.status(400).json({ error: 'Say what needs to change' })
+    // The Submission review page always asks for a reason; the older Tasks page may leave it empty.
+    if (requireNote && !review_notes) return res.status(400).json({ error: 'Say why it is rejected' })
 
     const { data: task } = await supabase
       .from('tasks')
@@ -2031,7 +2032,7 @@ async function requestChanges(req, res) {
       .update({
         status:       'rejected',
         reviewed_by:  req.reviewerId,
-        review_notes,
+        review_notes: review_notes || null,
         reviewed_at:  new Date().toISOString(),
       })
       .eq('id', id)
@@ -2043,8 +2044,8 @@ async function requestChanges(req, res) {
       await createNotification({
         userId: task.assignee_id,
         type:   'task_rejected',
-        title:  `Changes requested ✏️`,
-        body:   `"${task.name}" (${task.task_code || id.slice(0,8)}) needs changes: ${review_notes}`,
+        title:  `Task rejected ❌`,
+        body:   `"${task.name}" (${task.task_code || id.slice(0,8)}) was rejected. ${review_notes || 'Please review and redo.'}`,
         link:   '/app/tasks',
       })
     }
@@ -2054,7 +2055,7 @@ async function requestChanges(req, res) {
     res.status(500).json({ error: err.message })
   }
 }
-router.put('/tasks/:id/request-changes', requireAdminOrPartner, taskInPartnerScope, requestChanges)
-router.put('/tasks/:id/reject',          requireAdminOrPartner, taskInPartnerScope, requestChanges)
+router.put('/tasks/:id/request-changes', requireAdminOrPartner, taskInPartnerScope, rejectTask(true))
+router.put('/tasks/:id/reject',          requireAdminOrPartner, taskInPartnerScope, rejectTask(false))
 
 module.exports = router
