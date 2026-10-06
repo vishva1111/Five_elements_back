@@ -222,25 +222,31 @@ router.patch('/profile', requirePartner, async (req, res) => {
 async function treeCountsByProject(projectIds) {
   const recorded = {}
   const planted  = {}
+  // Where the trees stand (for the map on a project card); capped so the list stays light.
+  const points   = {}
   const pids = [...new Set((projectIds || []).filter(Boolean))]
-  if (pids.length === 0) return { recorded, planted }
+  if (pids.length === 0) return { recorded, planted, points }
   const [withStage, captures] = await Promise.all([hasStageColumn(), treeTasks.captureTreeIds()])
   for (let from = 0; ; from += 1000) {
     const { data: rows, error } = await supabase
       .from('tree_records')
-      .select('id, project_id, quantity' + (withStage ? ', stage' : ''))
+      .select('id, project_id, quantity, latitude, longitude, tree_condition' + (withStage ? ', stage' : ''))
       .in('project_id', pids)
       .range(from, from + 999)
     if (error) throw error
     for (const r of rows || []) {
       if (captures.has(r.id)) continue
       const q = Number(r.quantity) || 1
+      if (Number(r.latitude) && Number(r.longitude)) {
+        const list = (points[r.project_id] ||= [])
+        if (list.length < 300) list.push({ id: r.id, latitude: Number(r.latitude), longitude: Number(r.longitude), condition: r.tree_condition || null })
+      }
       recorded[r.project_id] = (recorded[r.project_id] || 0) + q
       if (withStage && r.stage && r.stage !== 'Under plantation') planted[r.project_id] = (planted[r.project_id] || 0) + q
     }
     if (!rows || rows.length < 1000) break
   }
-  return { recorded, planted }
+  return { recorded, planted, points }
 }
 
 router.get('/dashboard', requirePartner, async (req, res) => {
@@ -459,7 +465,7 @@ router.get('/projects', requirePartner, async (req, res) => {
     if (projectIds.length === 0) return res.json({ projects: [] })
 
     // The project rows and everything keyed by project id are independent — fetch them together.
-    const [{ data: projects, error: projErr }, { recorded, planted }, extras, boundaries, requests] = await Promise.all([
+    const [{ data: projects, error: projErr }, { recorded, planted, points }, extras, boundaries, requests] = await Promise.all([
       supabase
         .from('projects')
         .select(`
@@ -489,6 +495,7 @@ router.get('/projects', requirePartner, async (req, res) => {
       fundedTrees:     p.funded_trees,
       treesRecorded:   recorded[p.id] || 0,
       treesPlanted:    planted[p.id] || 0,
+      treePoints:      points[p.id] || [],
       progressPct:     p.total_trees > 0 ? Math.min(100, Math.round((p.funded_trees / p.total_trees) * 100)) : 0,
       tco2e:           p.tco2e,
       evidenceCount:   p.evidence_count,
