@@ -8,20 +8,20 @@ const supabase = require('../supabaseClient')
  */
 router.get('/', async (req, res) => {
   try {
-    // Fetch all projects (funded ones for this org)
-    const { data: projects, error: projErr } = await supabase
-      .from('projects')
-      .select('id, name, element, category, partner, location, country, funded_trees, total_trees, tco2e, verified, status, certification, funded_amount, verification_status, has_ledger_entry')
-      .order('funded_amount', { ascending: false })
+    // Projects and platform stats are independent — fetch them together.
+    const [{ data: projects, error: projErr }, { data: stats }] = await Promise.all([
+      supabase
+        .from('projects')
+        .select('id, name, element, category, partner, location, country, funded_trees, total_trees, tco2e, verified, status, certification, funded_amount, verification_status, has_ledger_entry')
+        .order('funded_amount', { ascending: false }),
+      supabase
+        .from('platform_stats')
+        .select('trees_funded, t_co2e_verified, projects_active')
+        .eq('id', 1)
+        .single(),
+    ])
 
     if (projErr) throw projErr
-
-    // Fetch platform stats for summary strip
-    const { data: stats } = await supabase
-      .from('platform_stats')
-      .select('trees_funded, t_co2e_verified, projects_active')
-      .eq('id', 1)
-      .single()
 
     const rows = (projects || []).map(p => {
       const pct = p.total_trees > 0 ? Math.round((p.funded_trees / p.total_trees) * 100) : 0

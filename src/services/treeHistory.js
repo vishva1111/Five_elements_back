@@ -71,15 +71,18 @@ function pointOf(row) {
 async function allTasksFor(treeIds) {
   const ids = [...new Set((treeIds || []).filter(Boolean))]
   const byId = new Map()
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const part = ids.slice(i, i + CHUNK)
-    const { data, error } = await supabase.from('tasks').select('*').in('tree_id', part)
-    if (error) throw error
-    for (const t of data || []) byId.set(t.id, t)
+  const parts = []
+  for (let i = 0; i < ids.length; i += CHUNK) parts.push(ids.slice(i, i + CHUNK))
+  // Every chunk and both link columns are independent — one round trip, not many.
+  const results = await Promise.all(parts.flatMap(part => [
+    supabase.from('tasks').select('*').in('tree_id', part),
     // Audit tasks the app created itself may only carry tree_record_id.
-    const linked = await supabase.from('tasks').select('*').in('tree_record_id', part)
-    if (!linked.error) for (const t of linked.data || []) byId.set(t.id, t)
-  }
+    supabase.from('tasks').select('*').in('tree_record_id', part),
+  ]))
+  results.forEach(({ data, error }, i) => {
+    if (error) { if (i % 2 === 0) throw error; return }   // tree_record_id may not exist yet
+    for (const t of data || []) byId.set(t.id, t)
+  })
   const out = Object.fromEntries(ids.map(id => [id, []]))
   for (const t of byId.values()) {
     const key = ids.includes(t.tree_id) ? t.tree_id : t.tree_record_id
@@ -93,12 +96,14 @@ async function allTasksFor(treeIds) {
 async function monitoringFor(treeIds) {
   const ids = [...new Set((treeIds || []).filter(Boolean))]
   const out = Object.fromEntries(ids.map(id => [id, []]))
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const { data, error } = await supabase
-      .from('tree_monitoring_records')
-      .select('*')
-      .in('tree_record_id', ids.slice(i, i + CHUNK))
-      .order('monitoring_round', { ascending: true })
+  const parts = []
+  for (let i = 0; i < ids.length; i += CHUNK) parts.push(ids.slice(i, i + CHUNK))
+  const results = await Promise.all(parts.map(part => supabase
+    .from('tree_monitoring_records')
+    .select('*')
+    .in('tree_record_id', part)
+    .order('monitoring_round', { ascending: true })))
+  for (const { data, error } of results) {
     if (error) {
       if (isMissingSchema(error)) return out
       throw error
@@ -135,10 +140,10 @@ async function monitoringForTrees(treeIds, tasksByTree) {
 async function rowsById(table, ids, columns = '*') {
   const list = [...new Set((ids || []).filter(Boolean))]
   const out = {}
-  for (let i = 0; i < list.length; i += CHUNK) {
-    const { data } = await supabase.from(table).select(columns).in('id', list.slice(i, i + CHUNK))
-    for (const r of data || []) out[r.id] = r
-  }
+  const parts = []
+  for (let i = 0; i < list.length; i += CHUNK) parts.push(list.slice(i, i + CHUNK))
+  const results = await Promise.all(parts.map(part => supabase.from(table).select(columns).in('id', part)))
+  for (const { data } of results) for (const r of data || []) out[r.id] = r
   return out
 }
 
@@ -264,8 +269,10 @@ async function treeHistory(tree) {
   ])
   const tasks = tasksByTree[tree.id] || []
   const records = recordsByTree[tree.id] || []
-  const captures = await rowsById('tree_records', tasks.map(t => t.capture_tree_id))
-  const names = await namesFor([tree.user_id, ...tasks.flatMap(t => [t.assignee_id, t.reviewed_by])])
+  const [captures, names] = await Promise.all([
+    rowsById('tree_records', tasks.map(t => t.capture_tree_id)),
+    namesFor([tree.user_id, ...tasks.flatMap(t => [t.assignee_id, t.reviewed_by])]),
+  ])
 
   const timeline = buildTimeline(tree, tasks, records, captures, names)
   const photos = collectPhotos(tree, timeline)
@@ -312,21 +319,23 @@ async function treeHistory(tree) {
  * Lightweight per-tree summary for lists and cards:
  * { [treeId]: { photoUrls, photoCount, auditCount, latestAudit } }.
  */
-async function treeSummaries(trees) {
+async function treeSummaries(trees, preloadedTasks) {
   const list = (trees || []).filter(t => t && t.id)
   if (list.length === 0) return {}
   const ids = list.map(t => t.id)
-  // List queries pick their columns; photo_urls may not be one of them (or may not exist).
-  const tasksByTree = await allTasksFor(ids)
-  const [recordsByTree, extraPhotos] = await Promise.all([
+  // Callers that already loaded every task per tree pass them in (saves a round trip).
+  const tasksByTree = preloadedTasks || await allTasksFor(ids)
+  // Audit rows, capture photos and the photo_urls column are independent of each other.
+  // (List queries pick their columns; photo_urls may not be one of them, or may not exist.)
+  const [recordsByTree, extraPhotos, captures] = await Promise.all([
     monitoringForTrees(ids, tasksByTree),
     list.some(t => !('photo_urls' in t)) ? rowsById('tree_records', ids, 'id, photo_urls') : Promise.resolve({}),
+    rowsById(
+      'tree_records',
+      Object.values(tasksByTree).flat().map(t => t.capture_tree_id),
+      'id, photo_url, photo_urls, tree_condition, health_status, survey_date, latitude, longitude',
+    ),
   ])
-  const captures = await rowsById(
-    'tree_records',
-    Object.values(tasksByTree).flat().map(t => t.capture_tree_id),
-    'id, photo_url, photo_urls, tree_condition, health_status, survey_date, latitude, longitude',
-  )
 
   const out = {}
   for (const row of list) {
@@ -352,4 +361,4 @@ async function treeSummaries(trees) {
   return out
 }
 
-module.exports = { treeHistory, treeSummaries, buildTimeline, parsePhotoList, photosOf, isMissingSchema }
+module.exports = { treeHistory, treeSummaries, allTasksFor, buildTimeline, parsePhotoList, photosOf, isMissingSchema }

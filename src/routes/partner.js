@@ -52,7 +52,7 @@ const { parseDonorSheet, templateCsv: donorTemplateCsv } = require('../services/
 const { recordFunding } = require('../services/funding')
 const { syncProjectStats } = require('../services/projectStats')
 const treeTasks = require('../services/treeTasks')
-const { treeHistory, treeSummaries } = require('../services/treeHistory')
+const { treeHistory, treeSummaries, allTasksFor } = require('../services/treeHistory')
 const projectChanges = require('../services/projectChanges')
 const { listAllAuthUsers } = require('../services/authUsers')
 const {
@@ -70,7 +70,16 @@ const {
   formatFileSize,
   autoCreateVerificationTasks,
   partnerOwnedUserIds,
+  partnerScopeCached,
+  partnerOwnedUserIdsCached,
+  clearPartnerCache,
 } = require('../services/partnerHelpers')
+
+// Anything that changes data drops the short-lived scope cache, before and after it runs.
+router.use((req, res, next) => {
+  if (req.method !== 'GET') { clearPartnerCache(); res.on('finish', clearPartnerCache) }
+  next()
+})
 
 // ── POST /api/partner/apply ───────────────────────────────────────────────────
 // No requirePartner here on purpose — applicants are not partners yet.
@@ -215,8 +224,7 @@ async function treeCountsByProject(projectIds) {
   const planted  = {}
   const pids = [...new Set((projectIds || []).filter(Boolean))]
   if (pids.length === 0) return { recorded, planted }
-  const withStage = await hasStageColumn()
-  const captures = await treeTasks.captureTreeIds()
+  const [withStage, captures] = await Promise.all([hasStageColumn(), treeTasks.captureTreeIds()])
   for (let from = 0; ; from += 1000) {
     const { data: rows, error } = await supabase
       .from('tree_records')
@@ -239,17 +247,21 @@ router.get('/dashboard', requirePartner, async (req, res) => {
   try {
     const userId = req.userId
 
-    const { data: profile } = await supabase
-      .from('partner_profiles')
-      .select('id, org_name, status')
-      .eq('user_id', userId)
-      .maybeSingle()
+    const [{ data: profile }, { submissions, submissionIds, projectIds }] = await Promise.all([
+      supabase
+        .from('partner_profiles')
+        .select('id, org_name, status')
+        .eq('user_id', userId)
+        .maybeSingle(),
+      partnerScopeCached(userId),
+    ])
 
     if (!profile) {
       return res.json({ stats: {}, alerts: [], activeProjects: [], recentSubmissions: [], recentEvidence: [], fieldActivity: [] })
     }
 
-    const { submissions, submissionIds, projectIds } = await partnerScope(userId)
+    // Reconcile runs while the evidence, projects and funding load; the tree counts below wait for it.
+    const reconciled = treeTasks.reconcileQuietly()
 
     // Evidence belongs to submissions, not to the partner profile.
     const [evidenceRes, projectsRes, fundingsRes, deliveredRes, treesRes] = await Promise.all([
@@ -349,7 +361,7 @@ router.get('/dashboard', requirePartner, async (req, res) => {
     }
 
     // Same tree counts as the Projects page, so a project reads the same in both.
-    await treeTasks.reconcileQuietly()
+    await reconciled
     const { recorded, planted } = await treeCountsByProject(projects.map(p => p.id))
 
     const activeProjects = projects.map(p => {
@@ -427,41 +439,44 @@ router.get('/dashboard', requirePartner, async (req, res) => {
 // /submissions, which tracks the review pipeline (pending/approved/rejected).
 router.get('/projects', requirePartner, async (req, res) => {
   try {
-    await treeTasks.reconcileQuietly()   // so fresh field-app captures are known as captures before counting
     const userId = req.userId
 
-    const { data: subs, error: subErr } = await supabase
-      .from('project_submissions')
-      .select('id, title, project_id, submitted_at')
-      .eq('submitted_by', userId)
-      .eq('status', 'approved')
-      .not('project_id', 'is', null)
+    // Reconcile first so fresh field-app captures are known as captures before counting —
+    // it runs while the submissions load.
+    const [, { data: subs, error: subErr }] = await Promise.all([
+      treeTasks.reconcileQuietly(),
+      supabase
+        .from('project_submissions')
+        .select('id, title, project_id, submitted_at')
+        .eq('submitted_by', userId)
+        .eq('status', 'approved')
+        .not('project_id', 'is', null),
+    ])
 
     if (subErr) throw subErr
 
     const projectIds = [...new Set((subs || []).map(s => s.project_id))]
     if (projectIds.length === 0) return res.json({ projects: [] })
 
-    const { data: projects, error: projErr } = await supabase
-      .from('projects')
-      .select(`
-        id, name, element, category, location, description,
-        total_trees, funded_trees, tco2e, evidence_count, funders_count,
-        status, active, cover_image, last_evidence_date
-      `)
-      .in('id', projectIds)
+    // The project rows and everything keyed by project id are independent — fetch them together.
+    const [{ data: projects, error: projErr }, { recorded, planted }, extras, boundaries, requests] = await Promise.all([
+      supabase
+        .from('projects')
+        .select(`
+          id, name, element, category, location, description,
+          total_trees, funded_trees, tco2e, evidence_count, funders_count,
+          status, active, cover_image, last_evidence_date
+        `)
+        .in('id', projectIds),
+      treeCountsByProject(projectIds),
+      projectChanges.projectExtras(projectIds),
+      projectChanges.geofencesFor(projectIds),
+      projectChanges.listChangeRequests({ projectIds }),
+    ])
 
     if (projErr) throw projErr
 
     const approvedAtMap = Object.fromEntries((subs || []).map(s => [s.project_id, s.submitted_at]))
-
-    const ids = (projects || []).map(p => p.id)
-    const [{ recorded, planted }, extras, boundaries, requests] = await Promise.all([
-      treeCountsByProject(ids),
-      projectChanges.projectExtras(ids),
-      projectChanges.geofencesFor(ids),
-      projectChanges.listChangeRequests({ projectIds: ids }),
-    ])
 
     const result = (projects || []).map(p => ({
       id:              p.id,
@@ -1914,21 +1929,26 @@ const MAX_TREES_PER_ENTRY = 500
 // ── GET /api/partner/trees — list, for the partner's own people/projects ────
 router.get('/trees', requirePartner, async (req, res) => {
   try {
-    await treeTasks.reconcileQuietly({ force: true })   // Assign action: a just-completed planting must show "Review planting" now
-    const { userIds: ownedIds } = await partnerOwnedUserIds(req.userId)
+    // Everything here that does not depend on something else is fetched together:
+    // a just-completed planting must show "Review planting" now (force), while the
+    // team, projects and column checks load alongside it.
+    const reconciled = treeTasks.reconcileQuietly({ force: true })
+    const [{ userIds: ownedIds }, { projectIds }, [withStage, withAssigned, withPhotoUrls]] = await Promise.all([
+      partnerOwnedUserIdsCached(req.userId),
+      partnerScopeCached(req.userId),
+      Promise.all([hasStageColumn(), hasAssignedColumn(), hasTreeColumn('photo_urls')]),
+    ])
     // Always include the partner's own auth ID so records they entered directly
     // (e.g. seeded data or records added via the partner account) are visible.
     const userIds = [...new Set([...ownedIds, req.userId])]
-
-    const { projectIds } = await partnerScope(req.userId)
     if (projectIds.length === 0) return res.json({ trees: [] })
 
-    const [withStage, withAssigned] = await Promise.all([hasStageColumn(), hasAssignedColumn()])
     let query = supabase
       .from('tree_records')
       .select('id, tree_id, species, scientific_name, quantity, event_type, health_status, tree_condition, latitude, longitude, photo_url, notes, project_id, user_id, surveyor, submitted_at, survey_date'
         + (withStage ? ', stage' : '')
-        + (withAssigned ? ', assigned_to, team_member_id' : ''))
+        + (withAssigned ? ', assigned_to, team_member_id' : '')
+        + (withPhotoUrls ? ', photo_urls' : ''))
       .in('user_id', userIds)
       .in('project_id', projectIds)
       .order('submitted_at', { ascending: false })
@@ -1937,49 +1957,49 @@ router.get('/trees', requirePartner, async (req, res) => {
     if (req.query.project_id) query = query.eq('project_id', req.query.project_id)
     if (req.query.user_id)    query = query.eq('user_id', req.query.user_id)
 
-    const { data: rawTrees, error } = await query
+    // The list loads while reconcile finishes (nothing below needs it until the tasks are read).
+    const [{ data: rawTrees, error }] = await Promise.all([query, reconciled])
     if (error) throw error
-    // A field-app capture that completed a task is evidence for its tree, not a tree of its own.
-    const captures = await treeTasks.captureTreeIds()
-    const data = (rawTrees || []).filter(t => !captures.has(t.id))
 
-    const uniqueUserIds = [...new Set((data || []).map(t => t.user_id))]
-    const uniqueProjectIds = [...new Set((data || []).map(t => t.project_id))]
-    const [namesRes, projectsRes, tasksRes] = await Promise.all([
+    const rawIds = (rawTrees || []).map(t => t.id)
+    const uniqueUserIds = [...new Set((rawTrees || []).map(t => t.user_id))]
+    const uniqueProjectIds = [...new Set((rawTrees || []).map(t => t.project_id))]
+    const [namesRes, projectsRes, tasksByTree, extras, captureRows] = await Promise.all([
       uniqueUserIds.length
         ? supabase.from('profiles').select('auth_id, display_name').in('auth_id', uniqueUserIds)
         : Promise.resolve({ data: [] }),
       uniqueProjectIds.length
         ? supabase.from('projects').select('id, name').in('id', uniqueProjectIds)
         : Promise.resolve({ data: [] }),
-      // So the list can show "task pending" / "verified" without a second round trip per row.
-      treeTasks.tasksForTrees((data || []).map(t => t.id)),
+      // Every task per tree: shows "task pending" / "verified" per row and feeds the audit summary.
+      allTasksFor(rawIds),
+      projectChanges.projectExtras(uniqueProjectIds),
+      // A field-app capture that completed a task is evidence for its tree, not a tree of its own.
+      rawIds.length ? supabase.from('tasks').select('capture_tree_id').in('capture_tree_id', rawIds) : Promise.resolve({ data: [] }),
     ])
+    const captures = new Set((captureRows.data || []).map(r => r.capture_tree_id))
+    const data = (rawTrees || []).filter(t => !captures.has(t.id))
     const nameMap    = Object.fromEntries((namesRes.data || []).map(p => [p.auth_id, p.display_name]))
     const projectMap = Object.fromEntries((projectsRes.data || []).map(p => [p.id, p.name]))
     // The task that matters right now: planting while under plantation, audit after.
     const taskMap = {}
     for (const t of data || []) {
-      const slot = tasksRes[t.id] || {}
+      const slot = treeTasks.slotFor(tasksByTree[t.id])
       const planted = t.stage && t.stage !== 'Under plantation'
       taskMap[t.id] = planted ? (slot.audit || null) : (slot.planting || (withStage ? null : slot.audit) || null)
     }
-    // Names of the field operators on those tasks, and the captures that completed them.
+    // Names of the field operators on those tasks, the captures that completed them,
+    // and every photo + the latest audit per tree (a failure there must not break the list).
     const currentTasks = Object.values(taskMap).filter(Boolean)
     const assigneeIds = [...new Set(currentTasks.map(t => t.assignee_id).filter(Boolean))]
     const captureIds  = [...new Set(currentTasks.map(t => t.capture_tree_id).filter(Boolean))]
-    const [assigneesRes, capturesRes] = await Promise.all([
+    const [assigneesRes, capturesRes, summaries] = await Promise.all([
       assigneeIds.length ? supabase.from('profiles').select('auth_id, display_name').in('auth_id', assigneeIds) : Promise.resolve({ data: [] }),
       captureIds.length  ? supabase.from('tree_records').select('id, photo_url').in('id', captureIds)            : Promise.resolve({ data: [] }),
+      treeSummaries(data || [], tasksByTree).catch(e => { console.error('[partner/trees] summaries:', e.message); return {} }),
     ])
     const assigneeNames = Object.fromEntries((assigneesRes.data || []).map(p => [p.auth_id, p.display_name]))
     const capturesById  = Object.fromEntries((capturesRes.data || []).map(c => [c.id, c]))
-    // Every photo + the latest audit per tree, for the cards. A failure here
-    // must not break the list — the cards then just show the main photo.
-    const [summaries, extras] = await Promise.all([
-      treeSummaries(data || []).catch(e => { console.error('[partner/trees] summaries:', e.message); return {} }),
-      projectChanges.projectExtras(uniqueProjectIds),
-    ])
 
     res.json({
       trees: (data || []).map(t => ({
@@ -2033,10 +2053,12 @@ router.get('/trees', requirePartner, async (req, res) => {
 // ── GET /api/partner/trees/:id/history — photos, planting and every audit ───
 router.get('/trees/:id/history', requirePartner, async (req, res) => {
   try {
-    await treeTasks.reconcileQuietly({ force: true })
-    const { userIds } = await partnerOwnedUserIds(req.userId)
-    const { projectIds } = await partnerScope(req.userId)
-    const { data: tree, error } = await supabase.from('tree_records').select('*').eq('id', req.params.id).maybeSingle()
+    const [, { userIds }, { projectIds }, { data: tree, error }] = await Promise.all([
+      treeTasks.reconcileQuietly({ force: true }),
+      partnerOwnedUserIdsCached(req.userId),
+      partnerScopeCached(req.userId),
+      supabase.from('tree_records').select('*').eq('id', req.params.id).maybeSingle(),
+    ])
     if (error) throw error
     const mine = tree && (userIds.includes(tree.user_id) || tree.user_id === req.userId || projectIds.includes(tree.project_id))
     if (!mine) return res.status(404).json({ error: 'Tree record not found' })
