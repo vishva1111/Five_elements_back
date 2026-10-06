@@ -24,7 +24,50 @@ const { partnerScope } = require('../services/partnerHelpers')
 const { syncProjectStats, syncAllProjectStats } = require('../services/projectStats')
 const treeTasks = require('../services/treeTasks')
 
+// submitted_by columns hold auth ids — map them to something a reviewer can
+// read: profile display name first, then the auth account's email.
+async function submitterNames(authIds) {
+  const ids = [...new Set(authIds.filter(Boolean))]
+  if (ids.length === 0) return {}
+
+  const { data: profs } = await supabase
+    .from('profiles')
+    .select('auth_id, display_name, full_name, name')
+    .in('auth_id', ids)
+
+  const names = {}
+  ;(profs || []).forEach(p => {
+    const label = p.display_name || p.full_name || p.name
+    if (label) names[p.auth_id] = label
+  })
+
+  if (ids.some(id => !names[id])) {
+    const listed = await listAllAuthUsers()
+    ;(listed?.users || []).forEach(u => {
+      if (ids.includes(u.id) && !names[u.id] && u.email) names[u.id] = u.email
+    })
+  }
+  return names
+}
+
 // ─── A1: Approval queue ───────────────────────────────────────────────────────
+// GET /api/admin/queue/count — head-only counts for the sidebar badge, so every
+// admin page can show it without pulling the whole queue.
+router.get('/queue/count', requireAdmin, async (_req, res) => {
+  try {
+    const head = { count: 'exact', head: true }
+    const [ev, pr, pa] = await Promise.all([
+      supabase.from('evidence_files').select('id', head).eq('status', 'pending_review'),
+      supabase.from('project_submissions').select('id', head).eq('status', 'pending_review'),
+      supabase.from('partner_profiles').select('id', head).eq('status', 'pending'),
+    ])
+    const evidence = ev.count || 0, projects = pr.count || 0, partners = pa.count || 0
+    res.json({ total: evidence + projects + partners, evidence, projects, partners })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // GET /api/admin/queue
 router.get('/queue', requireAdmin, async (req, res) => {
   try {
@@ -35,7 +78,7 @@ router.get('/queue', requireAdmin, async (req, res) => {
     const [{ data: evidence }, { data: projects }, { data: partners }] = await Promise.all([
       supabase
         .from('evidence_files')
-        .select('id, submission_id, uploaded_at, project_submissions(project_id, submitted_by, title, element)')
+        .select('id, submission_id, file_name, uploaded_at, project_submissions(project_id, submitted_by, title, element)')
         .eq('status', 'pending_review')
         .order('uploaded_at', { ascending: true })
         .limit(50),
@@ -53,6 +96,12 @@ router.get('/queue', requireAdmin, async (req, res) => {
         .limit(50),
     ])
 
+    const names = await submitterNames([
+      ...(evidence || []).map(e => e.project_submissions?.submitted_by),
+      ...(projects || []).map(p => p.submitted_by),
+    ])
+    const nameOf = id => (id && (names[id] || id)) || '—'
+
     if (evidence) {
       evidence.forEach(e => {
         const sub = e.project_submissions
@@ -60,7 +109,8 @@ router.get('/queue', requireAdmin, async (req, res) => {
           id:          e.id,
           type:        'evidence',
           title:       sub?.title || 'Evidence submission',
-          submittedBy: sub?.submitted_by || '—',
+          detail:      e.file_name || '',
+          submittedBy: nameOf(sub?.submitted_by),
           submittedAt: e.uploaded_at ? new Date(e.uploaded_at).toLocaleDateString('en-GB') : '—',
           element:     sub?.element || '',
           priority:    'normal',
@@ -74,7 +124,7 @@ router.get('/queue', requireAdmin, async (req, res) => {
           id:          p.id,
           type:        'project',
           title:       p.title || 'Project submission',
-          submittedBy: p.submitted_by || '—',
+          submittedBy: nameOf(p.submitted_by),
           submittedAt: p.submitted_at ? new Date(p.submitted_at).toLocaleDateString('en-GB') : '—',
           element:     p.element || '',
           priority:    'normal',
@@ -126,14 +176,17 @@ router.get('/evidence/:id', requireAdmin, async (req, res) => {
     if (error || !ev) return res.status(404).json({ error: 'Not found' })
 
     const sub = ev.project_submissions
-    const [signed] = await withSignedUrls([ev])
+    const [[signed], names] = await Promise.all([
+      withSignedUrls([ev]),
+      submitterNames([sub?.submitted_by]),
+    ])
 
     res.json({
       id:            ev.id,
       submissionId:  ev.submission_id,
       projectTitle:  sub?.title || '—',
       element:       sub?.element || '—',
-      submittedBy:   sub?.submitted_by || '—',
+      submittedBy:   names[sub?.submitted_by] || sub?.submitted_by || '—',
       submittedAt:   ev.uploaded_at ? new Date(ev.uploaded_at).toLocaleDateString('en-GB') : '—',
       location:      sub?.location || '—',
       treeCount:     sub?.tree_count || 0,
@@ -523,8 +576,10 @@ router.get('/submissions', requireAdmin, async (req, res) => {
 
     if (error) throw error
 
+    const names = await submitterNames((data || []).map(s => s.submitted_by))
     const submissions = await Promise.all((data || []).map(async sub => ({
       ...sub,
+      submitted_by_name: names[sub.submitted_by] || null,
       evidence_files: await withSignedUrls(sub.evidence_files || []),
     })))
 
