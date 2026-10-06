@@ -220,14 +220,22 @@ async function runReconcile() {
   const codes = [...new Set(coded.map(t => t.code))]
   if (codes.length === 0) return 0
 
-  const treeIdByCode = {}
+  // The field app saves its capture under the SAME code as the partner's tree,
+  // so one code can name two records: the partner's tree (older) and the capture.
+  const recordsByCode = {}
   for (let i = 0; i < codes.length; i += 300) {
     const { data, error: treeErr } = await supabase
       .from('tree_records')
-      .select('id, tree_id')
+      .select('id, tree_id, submitted_at')
       .in('tree_id', codes.slice(i, i + 300))
     if (treeErr) throw treeErr
-    for (const r of data || []) treeIdByCode[r.tree_id] = r.id
+    for (const r of data || []) (recordsByCode[r.tree_id] = recordsByCode[r.tree_id] || []).push(r)
+  }
+  // The partner's own tree is the oldest record with that code. A task that
+  // already points at it is fine; one pointing at a newer record is a capture.
+  const treeIdByCode = {}
+  for (const [code, list] of Object.entries(recordsByCode)) {
+    treeIdByCode[code] = [...list].sort((a, b) => String(a.submitted_at).localeCompare(String(b.submitted_at)))[0].id
   }
 
   let fixed = 0
