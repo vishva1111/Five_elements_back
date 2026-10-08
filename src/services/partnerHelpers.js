@@ -262,7 +262,7 @@ function formatFileSize(bytes) {
  * Best-effort: failing to create a task must never fail the tree write that
  * triggered it. Returns the tasks actually created.
  */
-async function autoCreateVerificationTasks({ trees, projectId, partnerUserId, ownerRole, anyOwner = false, taskType = null }) {
+async function autoCreateVerificationTasks({ trees, projectId, partnerUserId, ownerRole, anyOwner = false, taskType = null, auditRound = null, dueDate = null }) {
   // `anyOwner` — the tree reached the Planted stage, which needs a field check
   // whoever it was recorded for.
   if (!anyOwner && !['business', 'individual'].includes(ownerRole)) return []
@@ -274,27 +274,37 @@ async function autoCreateVerificationTasks({ trees, projectId, partnerUserId, ow
     try {
       const { data: codeRow } = await supabase.rpc('generate_task_code', { p_tree_id: tree.id })
 
-      const { data: task, error } = await supabase
-        .from('tasks')
-        .insert({
-          name:         `${taskType === 'planting' ? 'Plant' : 'Tree Survey'} — ${tree.species || 'Unknown species'} (${tree.code || tree.id.slice(0, 8).toUpperCase()})`,
-          // planting | audit — only sent once the column exists (see services/treeTasks.js).
-          ...(taskType ? { task_type: taskType } : {}),
-          project_id:   projectId,
-          assignee_id:  partnerUserId,   // placeholder until reassigned to a Field Operator
-          tree_id:      tree.id,
-          task_code:    codeRow || null,
-          target_count: 1,
-          // Stays empty until the field operator completes the task — the app
-          // records where they actually were (same rule as bulk-generate).
-          location:     null,
-          priority:     'medium',
-          status:       'assigned',
-          captured:     0,
-          created_by:   partnerUserId,
-        })
-        .select('id, task_code, name')
-        .single()
+      const code = tree.code || tree.id.slice(0, 8).toUpperCase()
+      const species = tree.species || 'Unknown species'
+      const row = {
+        name:         taskType === 'planting' ? `Plant — ${species} (${code})`
+                    : taskType === 'audit' && auditRound ? `Audit ${auditRound} — ${species} (${code})`
+                    : `Tree Survey — ${species} (${code})`,
+        // planting | audit — only sent once the column exists (see services/treeTasks.js).
+        ...(taskType ? { task_type: taskType } : {}),
+        // Audit 1..4 and when that round is due (set by services/auditSchedule.js).
+        ...(auditRound ? { audit_round: auditRound } : {}),
+        ...(dueDate ? { due_date: dueDate } : {}),
+        project_id:   projectId,
+        assignee_id:  partnerUserId,   // placeholder until reassigned to a Field Operator
+        tree_id:      tree.id,
+        task_code:    codeRow || null,
+        target_count: 1,
+        // Stays empty until the field operator completes the task — the app
+        // records where they actually were (same rule as bulk-generate).
+        location:     null,
+        priority:     'medium',
+        status:       'assigned',
+        captured:     0,
+        created_by:   partnerUserId,
+      }
+      let { data: task, error } = await supabase.from('tasks').insert(row).select('id, task_code, name').single()
+      // A database without tasks.audit_round / due_date yet: keep the task, drop the extras.
+      if (error && /audit_round|due_date/i.test(error.message || '') && (auditRound || dueDate)) {
+        delete row.audit_round
+        delete row.due_date
+        ;({ data: task, error } = await supabase.from('tasks').insert(row).select('id, task_code, name').single())
+      }
 
       if (error) {
         console.error('[autoCreateVerificationTasks] insert failed:', error.message)

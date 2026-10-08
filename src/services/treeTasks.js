@@ -75,15 +75,20 @@ let captureCache = null
 async function captureTreeIds() {
   if (captureCache && Date.now() - captureCache.at < CAPTURE_TTL_MS) return captureCache.value
   if (!(await hasTaskTypeColumns())) return new Set()
-  const { data } = await supabase.from('tasks').select('capture_tree_id').not('capture_tree_id', 'is', null)
-  const value = new Set((data || []).map(r => r.capture_tree_id))
+  // A page at a time: past 1000 completed tasks, a single read would let captures show up as trees.
+  const value = new Set()
+  for (let f = 0; ; f += 1000) {
+    const { data } = await supabase.from('tasks').select('id, capture_tree_id').not('capture_tree_id', 'is', null).order('id').range(f, f + 999)
+    for (const r of data || []) value.add(r.capture_tree_id)
+    if (!data || data.length < 1000) break
+  }
   captureCache = { at: Date.now(), value }
   return value
 }
 const clearCaptureCache = () => { captureCache = null }
 
 /** Creates the planting or audit task for each tree that doesn't already have one of that type. */
-async function createTreeTasks({ trees, projectId, partnerUserId, type }) {
+async function createTreeTasks({ trees, projectId, partnerUserId, type, auditRound = null, dueDate = null }) {
   const { autoCreateVerificationTasks } = require('./partnerHelpers')
   if (!trees || trees.length === 0) return []
   const withType = await hasTaskTypeColumns()
@@ -91,7 +96,7 @@ async function createTreeTasks({ trees, projectId, partnerUserId, type }) {
   const existing = await tasksForTrees(trees.map(t => t.id))
   const todo = trees.filter(t => !existing[t.id]?.[type] && !(type === AUDIT && !withType && existing[t.id]?.all.length))
   if (todo.length === 0) return []
-  return autoCreateVerificationTasks({ trees: todo, projectId, partnerUserId, anyOwner: true, taskType: withType ? type : null })
+  return autoCreateVerificationTasks({ trees: todo, projectId, partnerUserId, anyOwner: true, taskType: withType ? type : null, auditRound, dueDate })
 }
 
 async function treeForTask(treeId) {
@@ -110,6 +115,8 @@ async function ensureAuditTask(treeId, partnerUserId) {
   const created = await createTreeTasks({
     trees: [{ id: tree.id, code: tree.tree_id, species: tree.species, latitude: tree.latitude, longitude: tree.longitude }],
     projectId: tree.project_id, partnerUserId, type: AUDIT,
+    // The first audit opens as soon as the tree is planted; the next three follow every 3 months.
+    auditRound: 1, dueDate: new Date().toISOString(),
   })
   return created[0] || null
 }
@@ -304,6 +311,9 @@ async function runReconcile() {
  */
 async function reconcileQuietly(opts) {
   try { await reconcileCaptureTasks(opts) } catch (e) { console.error('[treeTasks] reconcile:', e.message) }
+  // Every page that reads tasks also opens any audit that has come due — the server
+  // may have been asleep when the date arrived. Throttled and never awaited.
+  try { require('./auditSchedule').runDueQuietly() } catch { /* scheduling must never break a page */ }
 }
 
 module.exports = {

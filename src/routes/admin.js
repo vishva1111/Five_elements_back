@@ -29,6 +29,8 @@ router.use((req, res, next) => {
 })
 const { syncProjectStats, syncAllProjectStats } = require('../services/projectStats')
 const treeTasks = require('../services/treeTasks')
+const auditSchedule = require('../services/auditSchedule')
+const { activityFor } = require('../services/activityReport')
 const { treeHistory, treeSummaries, allTasksFor } = require('../services/treeHistory')
 const projectChanges = require('../services/projectChanges')
 
@@ -1475,25 +1477,44 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
   try {
     await treeTasks.reconcileQuietly()   // re-link field-app completions to their trees
     const { status, project_id, assignee_id } = req.query
-    let query = supabase
-      .from('tasks')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(200)
-
-    if (status)      query = query.eq('status', status)
-    if (project_id)  query = query.eq('project_id', project_id)
-    if (assignee_id) query = query.eq('assignee_id', assignee_id)
 
     // A partner works on their own projects only — never another partner's tasks.
+    let scope = null
     if (req.role === 'partner') {
-      const { projectIds } = await partnerScopeCached(req.userId)
-      if (projectIds.length === 0) return res.json({ tasks: [] })
-      query = query.in('project_id', projectIds)
+      scope = (await partnerScopeCached(req.userId)).projectIds
+      if (scope.length === 0) return res.json({ tasks: [] })
     }
 
-    const { data, error } = await query
-    if (error) throw error
+    // Every task, a page at a time — each tree has a planting task and up to four audits,
+    // so a fixed cap would silently hide the oldest ones. id breaks created_at ties so pages never overlap.
+    const data = []
+    for (let f = 0; ; f += 1000) {
+      let query = supabase
+        .from('tasks')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: true })
+        .range(f, f + 999)
+      if (status)      query = query.eq('status', status)
+      if (project_id)  query = query.eq('project_id', project_id)
+      if (assignee_id) query = query.eq('assignee_id', assignee_id)
+      if (scope)       query = query.in('project_id', scope)
+      const { data: page, error } = await query
+      if (error) throw error
+      data.push(...(page || []))
+      if (!page || page.length < 1000) break
+    }
+
+    // Looks rows up 300 ids at a time, so a long task list never makes an over-long request URL.
+    const rowsIn = async (table, columns, column, ids) => {
+      const out = []
+      for (let i = 0; i < ids.length; i += 300) {
+        const { data: rows, error } = await supabase.from(table).select(columns).in(column, ids.slice(i, i + 300))
+        if (error) return { data: out, error }
+        out.push(...(rows || []))
+      }
+      return { data: out }
+    }
 
     // Enrich with assignee name + project name + tree photo. The three lookups
     // below each key off `data` but not off each other, so they run concurrently
@@ -1502,18 +1523,16 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
     const projectIds = [...new Set((data || []).map(t => t.project_id).filter(Boolean))]
     // The tree, plus the field capture that completed the task (its photo is the evidence).
     const treeIds    = [...new Set((data || []).flatMap(t => [t.tree_id, t.capture_tree_id]).filter(Boolean))]
+    // An approved audit's next round waits in audit_schedule until its date, so it isn't a task yet.
+    const auditedTreeIds = [...new Set((data || []).filter(t => t.status === 'approved' && Number(t.audit_round) > 0).map(t => t.tree_id).filter(Boolean))]
 
-    const [profilesRes, projectsRes, treesRes] = await Promise.all([
-      profileIds.length > 0
-        ? supabase.from('profiles').select('auth_id, id, display_name, role, roles').in('auth_id', profileIds)
-        : Promise.resolve({ data: [] }),
-      projectIds.length > 0
-        ? supabase.from('projects').select('id, name').in('id', projectIds)
-        : Promise.resolve({ data: [] }),
+    const [profilesRes, projectsRes, treesRes, scheduleRes] = await Promise.all([
+      rowsIn('profiles', 'auth_id, id, display_name, role, roles', 'auth_id', profileIds),
+      rowsIn('projects', 'id, name', 'id', projectIds),
       // The photo the field user captured lives on the linked tree record, not the task.
-      treeIds.length > 0
-        ? supabase.from('tree_records').select('id, tree_id, photo_url, species, health_status, stage').in('id', treeIds)
-        : Promise.resolve({ data: [] }),
+      rowsIn('tree_records', 'id, tree_id, photo_url, species, health_status, stage', 'id', treeIds),
+      // No audit_schedule table yet → error, and the tasks simply carry no next_audit.
+      rowsIn('audit_schedule', 'tree_id, round, due_at, status, cancel_reason', 'tree_id', auditedTreeIds),
     ])
 
     const profileMap = {}
@@ -1528,6 +1547,12 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
     ;(projectsRes.data || []).forEach(p => { projectMap[p.id] = p.name })
     const treeMap = {}
     ;(treesRes.data || []).forEach(tr => { treeMap[tr.id] = tr })
+    const scheduleMap = {}
+    ;(scheduleRes.data || []).forEach(s => { scheduleMap[`${s.tree_id}:${s.round}`] = s })
+    const nextAuditOf = t => {
+      const s = t.status === 'approved' && Number(t.audit_round) > 0 ? scheduleMap[`${t.tree_id}:${Number(t.audit_round) + 1}`] : null
+      return s ? { round: s.round, due_at: s.due_at, status: s.status, cancel_reason: s.cancel_reason || null } : null
+    }
 
     res.json({
       tasks: (data || []).map(t => ({
@@ -1543,6 +1568,8 @@ router.get('/tasks', requireAdminOrPartner, async (req, res) => {
         tree_code:     t.tree_id ? (treeMap[t.tree_id]?.tree_id || `TREE-${String(t.tree_id).slice(0, 8).toUpperCase()}`) : null,
         assignee_role: roleMap[t.assignee_id] || null,
         progress:      taskProgress(t),
+        // The planned next audit (Audit 2-4) for an approved audit — pending, created, or cancelled (tree dead/missing).
+        next_audit:    nextAuditOf(t),
       }))
     })
   } catch (err) {
@@ -1934,6 +1961,61 @@ router.get('/tasks/pending-review', requireAdminOrPartner, async (req, res) => {
   }
 })
 
+// GET /api/admin/activity?from&to&project_id — the same report as the partner's, across every project.
+router.get('/activity', requireAdmin, async (req, res) => {
+  try {
+    const wanted = req.query.project_id ? String(req.query.project_id) : null
+    let ids = wanted ? [wanted] : null
+    if (!ids) {
+      const { data, error } = await supabase.from('projects').select('id')
+      if (error) throw error
+      ids = (data || []).map(p => p.id)
+    }
+    res.json(await activityFor({ projectIds: ids, from: req.query.from, to: req.query.to }))
+  } catch (err) {
+    console.error('[admin/activity]', err)
+    res.status(500).json({ error: 'Failed to load the activity report' })
+  }
+})
+
+// GET /api/admin/audit-schedule?project_id — audits still to come and dead/missing trees, every project.
+router.get('/audit-schedule', requireAdmin, async (req, res) => {
+  try {
+    const wanted = req.query.project_id ? String(req.query.project_id) : null
+    let ids = wanted ? [wanted] : null
+    if (!ids) {
+      const { data, error } = await supabase.from('projects').select('id')
+      if (error) throw error
+      ids = (data || []).map(p => p.id)
+    }
+    res.json(await auditSchedule.overview(ids))
+  } catch (err) {
+    console.error('[admin/audit-schedule]', err)
+    res.status(500).json({ error: 'Failed to load the audit schedule' })
+  }
+})
+
+// POST /api/admin/audit-schedule/backfill[?dry=1][&open_now=1] — label old audit tasks (Audit 1..4) and plan the next
+// audit for trees whose audit is already approved (open_now=1: open it today). dry=1 only reports what it would do.
+router.post('/audit-schedule/backfill', requireAdmin, async (req, res) => {
+  try {
+    const flag = v => v === '1' || v === 'true'
+    res.json(await auditSchedule.backfill({ dry: flag(req.query.dry), openNow: flag(req.query.open_now) }))
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /api/admin/audit-schedule/run — open every audit whose date has come, now.
+router.post('/audit-schedule/run', requireAdmin, async (req, res) => {
+  try {
+    const made = await auditSchedule.runDue({ limit: 500 })
+    res.json({ opened: made.length, tasks: made })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // PUT /api/admin/tasks/:id/approve
 router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, async (req, res) => {
   try {
@@ -1977,14 +2059,24 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, asyn
       return res.json({ success: true, planted: true, auditTask })
     }
 
-    // Approval is the verification moment — publish the capture to the ledger.
-    const ledger = await publishCaptureToLedger({
-      taskId:       id,
-      treeId:       task.tree_id,
-      projectId:    task.project_id,
-      reviewerId:   req.reviewerId,
-      reviewNotes:  review_notes,
+    // An approved audit plans the next one (Audit 2-4), 3 months from today — or stops the
+    // cycle when the tree was found dead/missing. Never lets a scheduling problem fail the approval.
+    const nextAudit = await auditSchedule.onAuditApproved(task).catch(e => {
+      console.error('[tasks/approve] audit schedule failed:', e.message)
+      return { error: e.message }
     })
+
+    // Approval is the verification moment — publish the capture to the ledger. A tree the audit
+    // found dead or missing is not verified impact, so it never enters the ledger this way.
+    const ledger = nextAudit?.stopped
+      ? { ok: false, skipped: `tree found ${nextAudit.stopped}` }
+      : await publishCaptureToLedger({
+          taskId:       id,
+          treeId:       task.tree_id,
+          projectId:    task.project_id,
+          reviewerId:   req.reviewerId,
+          reviewNotes:  review_notes,
+        })
 
     if (!ledger.ok && ledger.error) {
       console.error('[tasks/approve] ledger publish failed:', ledger.error)
@@ -2001,7 +2093,7 @@ router.put('/tasks/:id/approve', requireAdminOrPartner, taskInPartnerScope, asyn
       })
     }
 
-    res.json({ success: true, ledger })
+    res.json({ success: true, ledger, nextAudit })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
