@@ -101,4 +101,9 @@ app.use((err, req, res, next) => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Five Elements API running on http://localhost:${PORT}`)
+  // Open any audit whose date has come: once now (catches up after a restart or sleep), then hourly.
+  // Pages that read tasks also trigger this, so a sleeping server catches up on the next visit.
+  const auditSchedule = require('./services/auditSchedule')
+  auditSchedule.runDueQuietly(true)
+  setInterval(() => auditSchedule.runDueQuietly(true), 60 * 60 * 1000).unref()
 })
