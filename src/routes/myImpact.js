@@ -17,7 +17,7 @@ router.get('/', async (req, res) => {
 
     const { data, error } = await supabase
       .from('individual_fundings')
-      .select('id,user_id,project_id,trees_funded,amount_paid,funded_at,verification_status,public_attribution,funder_name,projects(name)')
+      .select('id,user_id,project_id,trees_funded,amount_paid,funded_at,verification_status,public_attribution,funder_name,projects(name,location,element)')
       .eq('user_id', userId)
       .order('funded_at', { ascending: false })
       .limit(200)
@@ -25,19 +25,26 @@ router.get('/', async (req, res) => {
     if (error) throw error
     const rows = data || []
 
-    const entries = rows.map(r => ({
-      id:       r.id,
-      date:     r.funded_at ? r.funded_at.split('T')[0] : '',
-      // Supabase returns a joined foreign table as an array here, not a
-      // single object — same quirk this query hit when it ran client-side.
-      project:  r.projects?.[0]?.name ?? r.project_id,
-      trees:    r.trees_funded,
-      tCO2e:    Math.round(r.trees_funded * 0.017 * 10) / 10,
-      verified: r.verification_status === 'verified',
-      txHash:   '',
-    }))
+    const entries = rows.map(r => {
+      // A many-to-one join comes back as a single object; tolerate the array
+      // shape too so a schema change can't put a raw id back on screen.
+      const proj = Array.isArray(r.projects) ? r.projects[0] : r.projects
+      return {
+        id:        r.id,
+        date:      r.funded_at ? r.funded_at.split('T')[0] : '',
+        projectId: r.project_id,
+        project:   proj?.name || r.project_id,
+        location:  proj?.location || '',
+        element:   (proj?.element || 'earth').toLowerCase(),
+        trees:     r.trees_funded,
+        tCO2e:     Math.round(r.trees_funded * 0.017 * 10) / 10,
+        amount:    Number(r.amount_paid) || 0,
+        verified:  r.verification_status === 'verified',
+        txHash:    '',
+      }
+    })
 
-    const uniqueProjects = new Set(entries.map(e => e.project)).size
+    const uniqueProjects = new Set(entries.map(e => e.projectId)).size
     const totalTrees     = entries.reduce((s, e) => s + (e.trees || 0), 0)
     const totalTCO2e     = entries.reduce((s, e) => s + (e.tCO2e || 0), 0)
     const totalFunds     = rows.reduce((s, r) => s + (Number(r.amount_paid) || 0), 0)

@@ -30,6 +30,7 @@ router.get('/', async (req, res) => {
         certificate_id,
         projects (
           id,
+          slug,
           name,
           element,
           category,
@@ -44,16 +45,23 @@ router.get('/', async (req, res) => {
     if (error) throw error
 
     const projects = (data || []).map(f => {
-      const p = f.projects || {}
+      // A many-to-one join is a single object; tolerate the array shape too.
+      const p = (Array.isArray(f.projects) ? f.projects[0] : f.projects) || {}
+      const trees = f.trees_funded || 0
       return {
         id:                 f.id,
+        projectId:          p.id || null,
+        projectSlug:        p.slug || null,
         name:               p.name || 'Unknown project',
         element:            p.element || 'earth',
         category:           p.category || '',
         partner:            p.partner || '',
         location:           p.location || '',
-        treesFunded:        f.trees_funded || 0,
-        tco2e:              parseFloat(p.tco2e || 0).toFixed(1),
+        treesFunded:        trees,
+        // This funding's own estimated offset — not the whole project's verified total.
+        tco2e:              (trees * 0.017).toFixed(1),
+        amount:             Number(f.amount_paid) || 0,
+        fundedAtRaw:        f.funded_at || null,
         fundedAt:           f.funded_at
           ? new Date(f.funded_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
           : '—',
