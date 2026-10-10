@@ -27,7 +27,6 @@ router.post('/', async (req, res) => {
     const {
       projectId,
       trees,
-      funderName = 'Anonymous',
       paymentMethod = 'card',
       publicAttribution = true,
     } = req.body
@@ -35,6 +34,21 @@ router.post('/', async (req, res) => {
     // userId comes exclusively from the verified JWT via requireAuth middleware.
     // Never trust req.body.userId — it could be spoofed by the caller.
     const userId = req.userId || null
+
+    // The funder's real name comes from their own profile, not the request body
+    // (older clients sent the literal 'Anonymous' here when hiding their name).
+    let funderName = typeof req.body.funderName === 'string' && req.body.funderName.trim() && req.body.funderName !== 'Anonymous'
+      ? req.body.funderName.trim()
+      : null
+    if (userId) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('display_name')
+        .eq('auth_id', userId)
+        .maybeSingle()
+      if (profile?.display_name) funderName = profile.display_name
+    }
+    funderName = funderName || 'Funder'
 
     // ── Validate input ────────────────────────────────────────────────────────
     if (!projectId || typeof projectId !== 'string') {

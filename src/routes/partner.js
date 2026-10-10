@@ -935,20 +935,27 @@ router.get('/funders', requirePartner, async (req, res) => {
     // Funder type isn't stored on the funding row — derive it from the profile.
     const funderIds = [...new Set((fundings || []).map(f => f.user_id).filter(Boolean))]
     let roleMap = {}
+    let nameMap = {}
     if (funderIds.length > 0) {
       const { data: profiles } = await supabase
         .from('profiles')
-        .select('auth_id, role')
+        .select('auth_id, role, display_name')
         .in('auth_id', funderIds)
       roleMap = Object.fromEntries((profiles || []).map(p => [p.auth_id, p.role]))
+      nameMap = Object.fromEntries((profiles || []).map(p => [p.auth_id, p.display_name]))
     }
 
     const funders = (fundings || []).map(f => {
       const anonymous = f.public_attribution === false
+      // The partner always sees the real funder — "anonymous" only hides the
+      // name on public surfaces. Older rows stored the literal 'Anonymous' as
+      // funder_name, so fall back to the funder's profile name for those.
+      const storedName = f.funder_name && f.funder_name !== 'Anonymous' ? f.funder_name : ''
+      const realName   = storedName || (f.user_id && nameMap[f.user_id]) || ''
       return {
         id:          f.id,
-        name:        anonymous ? 'Anonymous' : (f.funder_name || 'Unknown'),
-        rawName:     f.funder_name || '',
+        name:        realName || 'Unknown',
+        rawName:     realName,
         type:        roleMap[f.user_id] === 'business' ? 'business' : 'individual',
         project:     projectMap[f.project_id] || 'Unknown',
         treesFunded: f.trees_funded || 0,
