@@ -69,7 +69,9 @@ async function recordFunding({
         has_ledger_entry:   true,
         ledger_entry_id:    null,   // ledger entry id is a text field, not uuid — skip FK
         public_attribution: publicAttribution,
-        funder_name:        publicAttribution ? funderName : 'Anonymous',
+        // The real name is always kept here so the partner and admin can see
+        // who funded; public_attribution decides what public surfaces show.
+        funder_name:        funderName,
       })
       .select('id')
       .single()

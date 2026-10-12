@@ -21,7 +21,7 @@ router.get('/', async (req, res) => {
 
     let query = supabase
       .from('profiles')
-      .select('id, name, type, location, avatar, trees, t_co2e, created_at')
+      .select('id, auth_id, name, type, location, avatar, trees, t_co2e, created_at')
       .order('trees', { ascending: false })
       .gt('trees', 0)
 
@@ -30,7 +30,9 @@ router.get('/', async (req, res) => {
     const { data, error } = await query
     if (error) throw error
 
-    const profiles = (data || []).map(r => ({
+    // Organisations that set their public profile to private are left out.
+    const hidden = await privateOrgOwners()
+    const profiles = (data || []).filter(r => !hidden.has(r.auth_id)).map(r => ({
       id:       r.id,
       name:     r.name,
       type:     r.type?.toLowerCase() === 'business' ? 'organisation' : 'individual',
@@ -65,6 +67,10 @@ router.get('/:slug', async (req, res) => {
     if (profileErr || !profile) {
       return res.status(404).json({ error: 'Profile not found' })
     }
+
+    // A business's own public-profile settings (Business → Public profile).
+    const org = await orgSettingsFor(profile.auth_id)
+    if (org?.visibility === 'private') return res.status(404).json({ error: 'Profile not found' })
 
     // 2. Fetch ledger entries for this profile (funder = profile id)
     const { data: entriesData } = await supabase
@@ -118,10 +124,10 @@ router.get('/:slug', async (req, res) => {
     const totalTrees = Number(profile.trees) || 0
     const totalTco2e = Number(profile.t_co2e) || 0
     const stats = [
-      { label: 'Trees funded',   value: totalTrees.toLocaleString(), unit: 'trees' },
-      { label: 'tCO₂e offset',  value: totalTco2e.toFixed(1),       unit: 'tCO₂e' },
-      { label: 'Projects',       value: String(profile.projects_count || projectIds.length), unit: 'active' },
-    ]
+      org?.show_trees    === false ? null : { label: 'Trees funded',   value: totalTrees.toLocaleString(), unit: 'trees' },
+      org?.show_tco2e    === false ? null : { label: 'tCO₂e offset',  value: totalTco2e.toFixed(1),       unit: 'tCO₂e' },
+      org?.show_projects === false ? null : { label: 'Projects',       value: String(profile.projects_count || projectIds.length), unit: 'active' },
+    ].filter(Boolean)
     if (profile.member_since) {
       stats.push({ label: 'Verified since', value: profile.member_since, unit: '' })
     }
@@ -150,16 +156,16 @@ router.get('/:slug', async (req, res) => {
     res.json({
       id: profile.id,
       slug: profile.slug || profile.id,
-      displayName: profile.name,
-      bio: profile.bio || '',
+      displayName: org?.org_name || profile.name,
+      bio: org?.tagline || profile.bio || '',
       metaLine: [profile.location, profile.type, profile.member_since ? `Member since ${profile.member_since}` : null].filter(Boolean).join(' · '),
       isOrg: profile.is_org || false,
-      website: profile.website || null,
+      website: org?.website || profile.website || null,
       shareNote: profile.share_note || 'Share your verified climate action.',
       shareUrl,
       radarValues,
       stats,
-      tiles,
+      tiles: org?.show_ledger === false ? [] : tiles,
       projects: projectList,
       badges,
     })
@@ -168,5 +174,19 @@ router.get('/:slug', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' })
   }
 })
+
+// ── Business public-profile settings (business_orgs) ────────────────────────
+// Both helpers tolerate the table not existing yet (migration not run).
+
+async function orgSettingsFor(authId) {
+  if (!authId) return null
+  const { data, error } = await supabase.from('business_orgs').select('*').eq('owner_id', authId).maybeSingle()
+  return error ? null : data
+}
+
+async function privateOrgOwners() {
+  const { data, error } = await supabase.from('business_orgs').select('owner_id').eq('visibility', 'private')
+  return new Set(error ? [] : (data || []).map(r => r.owner_id))
+}
 
 module.exports = router

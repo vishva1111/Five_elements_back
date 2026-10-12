@@ -2,6 +2,7 @@ const express = require('express')
 const router = express.Router()
 const supabase = require('../supabaseClient')
 const { recordFunding } = require('../services/funding')
+const { computeProjectStats } = require('../services/projectStats')
 
 /**
  * POST /api/fund
@@ -27,7 +28,6 @@ router.post('/', async (req, res) => {
     const {
       projectId,
       trees,
-      funderName = 'Anonymous',
       paymentMethod = 'card',
       publicAttribution = true,
     } = req.body
@@ -36,12 +36,27 @@ router.post('/', async (req, res) => {
     // Never trust req.body.userId — it could be spoofed by the caller.
     const userId = req.userId || null
 
+    // The funder's real name comes from their own profile, not the request body
+    // (older clients sent the literal 'Anonymous' here when hiding their name).
+    let funderName = typeof req.body.funderName === 'string' && req.body.funderName.trim() && req.body.funderName !== 'Anonymous'
+      ? req.body.funderName.trim()
+      : null
+    if (userId) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('display_name')
+        .eq('auth_id', userId)
+        .maybeSingle()
+      if (profile?.display_name) funderName = profile.display_name
+    }
+    funderName = funderName || 'Funder'
+
     // ── Validate input ────────────────────────────────────────────────────────
     if (!projectId || typeof projectId !== 'string') {
       return res.status(400).json({ error: 'projectId is required' })
     }
-    if (!trees || typeof trees !== 'number' || trees < 1) {
-      return res.status(400).json({ error: 'trees must be a positive number' })
+    if (!Number.isInteger(trees) || trees < 1) {
+      return res.status(400).json({ error: 'trees must be a whole number of 1 or more' })
     }
 
     // ── Fetch project (try slug first, then id) ───────────────────────────────
@@ -74,6 +89,26 @@ router.post('/', async (req, res) => {
 
     if (project.status !== 'active') {
       return res.status(400).json({ error: 'Project is not accepting funding' })
+    }
+
+    // ── Tree limit: never fund more trees than the project has left ───────────
+    // Counted live from the funding records (all of them — computeProjectStats
+    // pages past PostgREST's 1000-row cap) rather than trusting the cached
+    // projects.funded_trees column. A project with no target has no limit.
+    const totalTrees = Number(project.total_trees) || 0
+    if (totalTrees > 0) {
+      const live = await computeProjectStats([project.id])
+      const alreadyFunded = live[project.id]?.funded_trees || 0
+      const remaining = Math.max(0, totalTrees - alreadyFunded)
+      if (remaining === 0) {
+        return res.status(400).json({ error: 'This project is fully funded', remaining: 0 })
+      }
+      if (trees > remaining) {
+        return res.status(400).json({
+          error: `Only ${remaining.toLocaleString('en-IN')} tree${remaining === 1 ? '' : 's'} left in this project`,
+          remaining,
+        })
+      }
     }
 
     // ── Record the funding (ledger entry, project counters, individual_fundings) ─

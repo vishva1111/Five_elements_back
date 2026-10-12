@@ -8,12 +8,16 @@
  * those records changes, so they can't drift.
  *
  *   funded_trees       = Σ individual_fundings.trees_funded
+ *   funded_amount      = Σ individual_fundings.amount_paid       (₹, incl. platform fee)
  *   funders_count      = distinct funders in individual_fundings
  *   tco2e              = Σ ledger_entries.co2e_verified        (verified CO₂ only)
  *   evidence_count     = ledger entries that verified trees    (approved captures)
  *   last_evidence_date = latest of those approvals
  *
  * Ledger rows that have been superseded by a correction are left out.
+ *
+ * Platform-wide totals (platform_stats) are derived from the projects the same
+ * way — see getPlatformStats().
  */
 const supabase = require('../supabaseClient')
 
@@ -39,12 +43,12 @@ function formatEvidenceDate(iso) {
 async function computeProjectStats(projectIds) {
   const ids = [...new Set((projectIds || []).filter(Boolean))]
   const stats = Object.fromEntries(ids.map(id => [id, {
-    funded_trees: 0, funders_count: 0, tco2e: 0, evidence_count: 0, last_evidence_date: null,
+    funded_trees: 0, funded_amount: 0, funders_count: 0, tco2e: 0, evidence_count: 0, last_evidence_date: null,
   }]))
   if (ids.length === 0) return stats
 
   const [fundings, ledger] = await Promise.all([
-    readAll(() => supabase.from('individual_fundings').select('project_id, user_id, funder_name, trees_funded').in('project_id', ids)),
+    readAll(() => supabase.from('individual_fundings').select('project_id, user_id, funder_name, trees_funded, amount_paid').in('project_id', ids)),
     readAll(() => supabase.from('ledger_entries').select('project_id, trees_verified, co2e_verified, approved_at, date, superseded_by').in('project_id', ids)),
   ])
 
@@ -52,7 +56,8 @@ async function computeProjectStats(projectIds) {
   for (const f of fundings) {
     const s = stats[f.project_id]
     if (!s) continue
-    s.funded_trees += Number(f.trees_funded) || 0
+    s.funded_trees  += Number(f.trees_funded) || 0
+    s.funded_amount += Number(f.amount_paid) || 0
     ;(funders[f.project_id] ||= new Set()).add(f.user_id || `name:${(f.funder_name || '').toLowerCase()}`)
   }
   for (const [pid, set] of Object.entries(funders)) stats[pid].funders_count = set.size
@@ -88,10 +93,41 @@ async function syncProjectStats(projectIds) {
         .eq('id', id)
       if (error) console.error(`[projectStats] update failed for ${id}:`, error.message)
     }
+    await refreshPlatformStatsRow()
     return stats
   } catch (e) {
     console.error('[projectStats] sync failed:', e.message)
     return null
+  }
+}
+
+/**
+ * Platform-wide totals, computed live from `projects` (whose columns the sync
+ * above keeps true). Read this — not the platform_stats row — wherever the
+ * totals are shown, so they can never go stale.
+ */
+async function getPlatformStats() {
+  const rows = await readAll(() => supabase.from('projects').select('status, funded_trees, tco2e'))
+  return {
+    treesFunded:    rows.reduce((s, r) => s + (Number(r.funded_trees) || 0), 0),
+    tCO2eVerified:  Math.round(rows.reduce((s, r) => s + (Number(r.tco2e) || 0), 0) * 100) / 100,
+    projectsActive: rows.filter(r => r.status === 'active').length,
+  }
+}
+
+/** Keeps the legacy platform_stats row in step for anything still reading it. */
+async function refreshPlatformStatsRow() {
+  try {
+    const p = await getPlatformStats()
+    const { error } = await supabase.from('platform_stats').update({
+      trees_funded:    p.treesFunded,
+      t_co2e_verified: p.tCO2eVerified,
+      projects_active: p.projectsActive,
+      updated_at:      new Date().toISOString(),
+    }).eq('id', 1)
+    if (error) console.error('[projectStats] platform_stats update failed:', error.message)
+  } catch (e) {
+    console.error('[projectStats] platform_stats refresh failed:', e.message)
   }
 }
 
@@ -101,4 +137,4 @@ async function syncAllProjectStats() {
   return syncProjectStats(projects.map(p => p.id))
 }
 
-module.exports = { computeProjectStats, syncProjectStats, syncAllProjectStats }
+module.exports = { computeProjectStats, syncProjectStats, syncAllProjectStats, getPlatformStats }

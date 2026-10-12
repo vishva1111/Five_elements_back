@@ -43,7 +43,9 @@ router.get('/:id', async (req, res) => {
     }
 
     // Fetch display name from profiles via auth_id
-    let displayName = data.funder_name || 'Anonymous'
+    // funder_name always holds the real name now, but this route is public —
+    // a funder who chose to stay anonymous must stay anonymous here.
+    let displayName = data.public_attribution ? (data.funder_name || 'Anonymous') : 'Anonymous'
     if (data.public_attribution && data.user_id) {
       const { data: profile } = await supabase
         .from('profiles')
