@@ -362,4 +362,29 @@ async function sendPasswordResetEmail({ toEmail, displayName, resetUrl }) {
   }
 }
 
-module.exports = { sendWelcomeEmail, sendRoleAddedEmail, sendAccountCreatedEmail, sendAccountApprovedEmail, sendPasswordResetEmail }
+const escHtml = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+
+/** A business added this person to their team. Never throws — the member row stands either way. */
+async function sendTeamInviteEmail({ toEmail, toName, orgName, inviterName, role }) {
+  const appUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
+  try {
+    await sendBrevoEmail({
+      toEmail,
+      toName,
+      subject: `${orgName} added you to their team on Five Elements`,
+      htmlContent: brandedEmail({
+        heading:  `You've been added to ${escHtml(orgName)}`,
+        bodyHtml: `<p style="color:#444;font-size:16px;line-height:1.6;margin:0 0 28px;">Hi ${escHtml(toName || 'there')}, ${escHtml(inviterName)} added you to <strong>${escHtml(orgName)}</strong>'s team on Five Elements as <strong>${escHtml(role)}</strong>. Create an account or sign in with this email address to get started.</p>`,
+        ctaLabel: 'Open Five Elements →',
+        ctaUrl:   `${appUrl}/signup`,
+        footnote: "If you weren't expecting this, you can ignore this email.",
+      }),
+    })
+    return true
+  } catch (err) {
+    console.error('[emailService] sendTeamInviteEmail failed:', err.message)
+    return false
+  }
+}
+
+module.exports = { sendWelcomeEmail, sendRoleAddedEmail, sendAccountCreatedEmail, sendAccountApprovedEmail, sendPasswordResetEmail, sendTeamInviteEmail }

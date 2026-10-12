@@ -75,6 +75,12 @@ async function requireAuth(req, res, next) {
   req.userId    = userId
   req.userEmail = payload.email
   req.role      = profile?.role || 'individual'
+  // Every role the account holds, not just the one it's switched to — a user
+  // with Individual + Business can use their Business pages whichever role is
+  // active (the frontend lets them in on the same basis).
+  // The active role always counts too — some older profiles have a role that's
+  // missing from their roles list.
+  req.roles     = [...new Set([...(profile?.roles || []), req.role])]
   req.profile   = profile   // the row above, so a route needing these fields doesn't fetch it again
 
   // A pending (not yet approved) or suspended account can't use the API — the
@@ -90,15 +96,17 @@ async function requireAuth(req, res, next) {
 }
 
 /**
- * requireRole(role) — factory that returns a middleware checking req.role.
- * Must be used AFTER requireAuth.
+ * requireRole(role) — factory that returns a middleware allowing the request
+ * when the account holds any of the given roles (req.roles), whichever role is
+ * currently active. Must be used AFTER requireAuth.
  */
 function requireRole(...allowedRoles) {
   return function (req, res, next) {
-    if (!allowedRoles.includes(req.role)) {
+    const held = req.roles || [req.role]
+    if (!allowedRoles.some(r => held.includes(r))) {
       return res.status(403).json({
         error: 'Forbidden',
-        detail: `This endpoint requires role: ${allowedRoles.join(' or ')}. Your role: ${req.role}`,
+        detail: `This endpoint requires role: ${allowedRoles.join(' or ')}. Your roles: ${held.join(', ')}`,
       })
     }
     next()

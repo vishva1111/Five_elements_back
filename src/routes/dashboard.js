@@ -2,82 +2,68 @@ const express = require('express')
 const router = express.Router()
 const supabase = require('../supabaseClient')
 
+const ELEMENT_GLYPH = { earth: '🌍', water: '💧', fire: '🔥', air: '💨', ether: '✨' }
+const TCO2E_PER_TREE = 0.017
+
+function fmtLocation(p) {
+  const loc = (p.location || '').trim()
+  const cty = (p.country  || '').trim()
+  // avoid "West Bengal, India, India" when location already ends with country
+  if (cty && !loc.endsWith(cty)) return [loc, cty].filter(Boolean).join(', ')
+  return loc || cty || '—'
+}
+
 /**
  * GET /api/dashboard
- * Returns aggregated dashboard data:
- *   - verified impact (trees funded, tCO2e offset, projects count)
- *   - funded portfolio (top 3 active projects)
+ * The signed-in organisation's own funding — never platform-wide figures.
+ * Returns every funding (light rows) plus the projects they went to, so the
+ * page can total any period it shows without another round trip.
  */
 router.get('/', async (req, res) => {
   try {
-    // 1. Fetch active projects (for portfolio section)
-    const { data: projects, error: projErr } = await supabase
-      .from('projects')
-      .select('id, slug, name, element, location, country, partner, certification, tco2e, funded_trees, total_trees, funders_count, verified, status')
-      .eq('status', 'active')
-      .order('funded_trees', { ascending: false })
-      .limit(3)
+    const { data: rows, error } = await supabase
+      .from('individual_fundings')
+      .select('id, project_id, trees_funded, amount_paid, funded_at, verification_status')
+      .eq('user_id', req.userId)
+      .order('funded_at', { ascending: false })
+    if (error) throw error
 
-    if (projErr) throw projErr
-
-    // 2. Fetch platform stats
-    const { data: statsRow } = await supabase
-      .from('platform_stats')
-      .select('trees_funded, t_co2e_verified, projects_active')
-      .eq('id', 1)
-      .single()
-
-    // ── Normalise projects for portfolio cards ─────────────────────────────
-    const ELEMENT_GLYPH = {
-      earth: '🌍', water: '💧', fire: '🔥', air: '💨', ether: '✨',
+    const projectIds = [...new Set((rows || []).map(r => r.project_id).filter(Boolean))]
+    let projects = []
+    if (projectIds.length > 0) {
+      const { data, error: pErr } = await supabase
+        .from('projects')
+        .select('id, slug, name, element, location, country, certification, total_trees, funded_trees, verified, status')
+        .in('id', projectIds)
+      if (pErr) throw pErr
+      projects = data || []
     }
-    const ELEMENT_HERO_BG = {
-      earth: 'linear-gradient(135deg,#2B5341,#4a7a5e)',
-      water: 'linear-gradient(135deg,#185FA5,#2a7fc4)',
-      fire:  'linear-gradient(135deg,#F09125,#e05a00)',
-      air:   'linear-gradient(135deg,#534AB7,#7b72d4)',
-      ether: 'linear-gradient(135deg,#112121,#2a3a3a)',
-    }
-
-    const portfolioProjects = (projects || []).map(p => {
-      const el = (p.element || 'earth').toLowerCase()
-      const pct = p.total_trees > 0 ? Math.round((p.funded_trees / p.total_trees) * 100) : 0
-      return {
-        id:          p.id,
-        slug:        p.slug,
-        name:        p.name,
-        element:     p.element,
-        elGlyph:     ELEMENT_GLYPH[el] || '🌍',
-        heroBg:      ELEMENT_HERO_BG[el] || ELEMENT_HERO_BG.earth,
-        location:    (() => {
-          const loc = (p.location || '').trim()
-          const cty = (p.country  || '').trim()
-          // avoid "West Bengal, India, India" when location already ends with country
-          if (cty && !loc.endsWith(cty)) return [loc, cty].filter(Boolean).join(', ')
-          return loc || cty || 'India'
-        })(),
-        standard:    p.certification || 'Verra VCS',
-        tco2:        p.tco2e ? p.tco2e.toFixed(0) : '0',
-        fundedTrees: p.funded_trees || 0,
-        totalTrees:  p.total_trees  || 0,
-        progressPct: pct,
-        verified:    p.verified || false,
-        status:      pct >= 100 ? 'Completed' : p.funded_trees > 0 ? 'Active' : 'Open',
-        statusBg:    pct >= 100 ? '#185FA5'   : p.funded_trees > 0 ? '#2B5341' : '#8B3A00',
-      }
-    })
-
-    const curYear = new Date().getFullYear()
 
     res.json({
-      impact: {
-        treesFunded:    statsRow?.trees_funded    || 0,
-        tco2eVerified:  statsRow?.t_co2e_verified || 0,
-        projectsActive: statsRow?.projects_active || (projects || []).length,
-        projectsFunded: portfolioProjects.length,
-      },
-      portfolio: portfolioProjects,
-      period:    `FY ${curYear}`,
+      fundings: (rows || []).map(r => ({
+        id:        r.id,
+        projectId: r.project_id,
+        date:      r.funded_at,
+        trees:     r.trees_funded || 0,
+        tco2e:     Math.round((r.trees_funded || 0) * TCO2E_PER_TREE * 100) / 100,
+        amount:    Number(r.amount_paid) || 0,
+        verified:  r.verification_status === 'verified',
+      })),
+      projects: projects.map(p => {
+        const el = (p.element || 'earth').toLowerCase()
+        return {
+          id:          p.id,
+          slug:        p.slug,
+          name:        p.name,
+          element:     el,
+          elGlyph:     ELEMENT_GLYPH[el] || '🌍',
+          location:    fmtLocation(p),
+          standard:    p.certification || '—',
+          totalTrees:  p.total_trees  || 0,
+          fundedTrees: p.funded_trees || 0,   // whole project, all funders
+          status:      p.status,
+        }
+      }),
       updatedAt: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }),
     })
   } catch (err) {
@@ -88,19 +74,30 @@ router.get('/', async (req, res) => {
 
 /**
  * GET /api/dashboard/tree-records
- * Recent tree records for the signed-in user. Admins may pass ?user_id= to
- * look at someone else's; anyone else always gets their own records.
+ * Field captures from the projects the signed-in user has funded — the
+ * evidence behind their money. Admins may pass ?user_id= to look at someone
+ * else's.
  */
 router.get('/tree-records', async (req, res) => {
   try {
     const user_id = (req.role === 'admin' && req.query.user_id) || req.userId
 
+    const { data: fundings, error: fErr } = await supabase
+      .from('individual_fundings')
+      .select('project_id')
+      .eq('user_id', user_id)
+    if (fErr) throw fErr
+
+    const projectIds = [...new Set((fundings || []).map(f => f.project_id).filter(Boolean))]
+    if (projectIds.length === 0) return res.json({ records: [] })
+
     const { data, error } = await supabase
       .from('tree_records')
-      .select('id, photo_url, latitude, longitude, species, health_status, notes, submitted_at, synced, project_id')
-      .eq('user_id', user_id)
+      .select('id, photo_url, latitude, longitude, species, health_status, notes, submitted_at, synced, project_id, status')
+      .in('project_id', projectIds)
+      .or('status.is.null,status.neq.rejected')   // keep un-reviewed captures, drop rejected ones
       .order('submitted_at', { ascending: false })
-      .limit(50)
+      .limit(12)
 
     if (error) throw error
     res.json({ records: data || [] })

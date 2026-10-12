@@ -2,69 +2,79 @@ const express = require('express')
 const router = express.Router()
 const supabase = require('../supabaseClient')
 
+const TCO2E_PER_TREE = 0.017
+
 /**
  * GET /api/portfolio
- * Returns the organisation's funded portfolio with summary stats.
+ * The signed-in organisation's own funded projects — one row per project with
+ * what *they* funded (trees, ₹, verification), plus summary totals.
  */
 router.get('/', async (req, res) => {
   try {
-    // Projects and platform stats are independent — fetch them together.
-    const [{ data: projects, error: projErr }, { data: stats }] = await Promise.all([
-      supabase
+    const { data: fundings, error } = await supabase
+      .from('individual_fundings')
+      .select('project_id, trees_funded, amount_paid, funded_at, verification_status')
+      .eq('user_id', req.userId)
+    if (error) throw error
+
+    const byProject = new Map()
+    for (const f of fundings || []) {
+      if (!f.project_id) continue
+      const g = byProject.get(f.project_id) || { trees: 0, amount: 0, fundings: 0, verifiedFundings: 0, verifiedTrees: 0, lastFunded: null }
+      const trees = f.trees_funded || 0
+      g.trees    += trees
+      g.amount   += Number(f.amount_paid) || 0
+      g.fundings += 1
+      if (f.verification_status === 'verified') { g.verifiedFundings += 1; g.verifiedTrees += trees }
+      if (f.funded_at && (!g.lastFunded || f.funded_at > g.lastFunded)) g.lastFunded = f.funded_at
+      byProject.set(f.project_id, g)
+    }
+
+    const ids = [...byProject.keys()]
+    let projects = []
+    if (ids.length > 0) {
+      const { data, error: pErr } = await supabase
         .from('projects')
-        .select('id, name, element, category, partner, location, country, funded_trees, total_trees, tco2e, verified, status, certification, funded_amount, verification_status, has_ledger_entry')
-        .order('funded_amount', { ascending: false }),
-      supabase
-        .from('platform_stats')
-        .select('trees_funded, t_co2e_verified, projects_active')
-        .eq('id', 1)
-        .single(),
-    ])
+        .select('id, slug, name, element, category, partner, location, country, certification, total_trees, funded_trees, status')
+        .in('id', ids)
+      if (pErr) throw pErr
+      projects = data || []
+    }
 
-    if (projErr) throw projErr
-
-    const rows = (projects || []).map(p => {
-      const pct = p.total_trees > 0 ? Math.round((p.funded_trees / p.total_trees) * 100) : 0
-      const verStatus = p.verification_status || (p.verified ? 'verified' : 'progress')
-      const barColor = verStatus === 'verified' ? '#2B5341' : verStatus === 'progress' ? '#F5C27A' : '#D8CEC2'
-      const rowBg = verStatus === 'paused' ? '#FDF6EE' : '#fff'
-
+    const rows = projects.map(p => {
+      const g = byProject.get(p.id)
+      const verification = g.verifiedFundings === g.fundings ? 'verified' : g.verifiedFundings > 0 ? 'partial' : 'pending'
       return {
-        id:                 p.id,
-        name:               p.name,
-        element:            p.element || 'earth',
-        category:           p.category || '—',
-        partner:            p.partner || '—',
-        location:           [p.location, p.country].filter(Boolean).join(', '),
-        fundedAmount:       p.funded_amount || 0,
-        fundedAmountFmt:    `£${(p.funded_amount || 0).toLocaleString('en-GB')}`,
-        fundedTrees:        p.funded_trees || 0,
-        totalTrees:         p.total_trees || 0,
-        progressPct:        pct,
-        progressLabel:      pct >= 100 ? '100%' : pct > 0 ? `${pct}%` : 'expected Q2 2026',
-        barColor,
-        rowBg,
-        verificationStatus: verStatus,
-        standard:           p.certification || 'Verra VCS',
-        hasLedgerEntry:     p.has_ledger_entry || false,
-        ledgerEntryId:      null,
-        tco2e:              parseFloat(p.tco2e || 0).toFixed(0),
+        id:               p.id,
+        slug:             p.slug,
+        name:             p.name,
+        element:          (p.element || 'earth').toLowerCase(),
+        category:         p.category || '—',
+        partner:          p.partner || '—',
+        location:         [p.location, p.country].filter(Boolean).filter((v, i, a) => i === 0 || !a[0].endsWith(v)).join(', ') || '—',
+        standard:         p.certification || '—',
+        trees:            g.trees,
+        amount:           g.amount,
+        fundings:         g.fundings,
+        verifiedFundings: g.verifiedFundings,
+        verifiedTrees:    g.verifiedTrees,
+        tco2e:            Math.round(g.trees * TCO2E_PER_TREE * 10) / 10,
+        verification,
+        projectFunded:    p.funded_trees || 0,
+        projectTotal:     p.total_trees  || 0,
+        lastFunded:       g.lastFunded,
       }
-    })
+    }).sort((a, b) => b.amount - a.amount)
 
-    // Summary totals
-    const totalFunded    = rows.reduce((s, r) => s + r.fundedAmount, 0)
-    const verifiedTco2   = rows.filter(r => r.verificationStatus === 'verified').reduce((s, r) => s + parseFloat(r.tco2e), 0)
-    const verifiedTrees  = rows.filter(r => r.verificationStatus === 'verified').reduce((s, r) => s + r.fundedTrees, 0)
-    const projectCount   = rows.length
-
+    const sum = (k) => rows.reduce((s, r) => s + (r[k] || 0), 0)
     res.json({
       summary: {
-        totalFunded:    `£${totalFunded.toLocaleString('en-GB')}`,
-        verifiedTco2:   verifiedTco2.toFixed(0),
-        verifiedTrees:  verifiedTrees.toLocaleString('en-GB'),
-        projectCount,
-        elementsActive: 1,
+        totalFunded:    sum('amount'),
+        trees:          sum('trees'),
+        verifiedTrees:  sum('verifiedTrees'),
+        tco2e:          Math.round(sum('trees') * TCO2E_PER_TREE * 10) / 10,
+        projectCount:   rows.length,
+        elementsActive: new Set(rows.map(r => r.element)).size,
         elementsTotal:  5,
       },
       projects: rows,
