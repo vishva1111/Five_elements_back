@@ -1,6 +1,7 @@
 const express = require('express')
 const router = express.Router()
 const supabase = require('../supabaseClient')
+const { fundingScope } = require('../services/funding')
 
 const ELEMENT_GLYPH = { earth: '🌍', water: '💧', fire: '🔥', air: '💨', ether: '✨' }
 const TCO2E_PER_TREE = 0.017
@@ -21,10 +22,11 @@ function fmtLocation(p) {
  */
 router.get('/', async (req, res) => {
   try {
-    const { data: rows, error } = await supabase
+    const scope = await fundingScope('business')
+    const { data: rows, error } = await scope(supabase
       .from('individual_fundings')
       .select('id, project_id, trees_funded, amount_paid, funded_at, verification_status')
-      .eq('user_id', req.userId)
+      .eq('user_id', req.userId))
       .order('funded_at', { ascending: false })
     if (error) throw error
 
@@ -82,10 +84,11 @@ router.get('/tree-records', async (req, res) => {
   try {
     const user_id = (req.role === 'admin' && req.query.user_id) || req.userId
 
-    const { data: fundings, error: fErr } = await supabase
+    const scope = await fundingScope('business')
+    const { data: fundings, error: fErr } = await scope(supabase
       .from('individual_fundings')
       .select('project_id')
-      .eq('user_id', user_id)
+      .eq('user_id', user_id))
     if (fErr) throw fErr
 
     const projectIds = [...new Set((fundings || []).map(f => f.project_id).filter(Boolean))]

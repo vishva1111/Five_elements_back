@@ -9,16 +9,19 @@
 const express = require('express')
 const router  = express.Router()
 const supabase = require('../supabaseClient')
+const { fundingScope } = require('../services/funding')
 
 router.get('/', async (req, res) => {
   try {
     const userId = req.userId
     if (!userId) return res.json({ entries: [], stats: { trees: 0, tCO2e: 0, projects: 0, fundsInvested: 0 } })
 
-    const { data, error } = await supabase
+    // ?as=business — the organisation's funding, for the Business ledger.
+    const scope = await fundingScope(req.query.as === 'business' ? 'business' : 'individual')
+    const { data, error } = await scope(supabase
       .from('individual_fundings')
       .select('id,user_id,project_id,trees_funded,amount_paid,funded_at,verification_status,public_attribution,funder_name,projects(name,location,element)')
-      .eq('user_id', userId)
+      .eq('user_id', userId))
       .order('funded_at', { ascending: false })
       .limit(200)
 

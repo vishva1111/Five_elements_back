@@ -1,7 +1,8 @@
 const express = require('express')
 const router = express.Router()
 const supabase = require('../supabaseClient')
-const { recordFunding } = require('../services/funding')
+const { recordFunding, fundedAsAvailable } = require('../services/funding')
+const { getOrgName } = require('../services/businessOrg')
 const { computeProjectStats } = require('../services/projectStats')
 
 /**
@@ -13,6 +14,7 @@ const { computeProjectStats } = require('../services/projectStats')
  *   paymentMethod: 'card' | 'invoice',
  *   publicAttribution: boolean,
  *   cardToken?: string,
+ *   fundedAs?: 'individual' | 'business',   // default 'individual'
  * }
  *
  * Returns: { orderId: string, status: 'success' }
@@ -31,17 +33,31 @@ router.post('/', async (req, res) => {
       paymentMethod = 'card',
       publicAttribution = true,
     } = req.body
+    const fundedAs = req.body.fundedAs === 'business' ? 'business' : 'individual'
 
     // userId comes exclusively from the verified JWT via requireAuth middleware.
     // Never trust req.body.userId — it could be spoofed by the caller.
     const userId = req.userId || null
+
+    // Funding as the business needs the Business role and the funded_as column.
+    if (fundedAs === 'business') {
+      if (!(req.roles || []).includes('business')) {
+        return res.status(403).json({ error: 'Only a business account can fund as a business.' })
+      }
+      if (!(await fundedAsAvailable())) {
+        return res.status(503).json({ error: 'Database update needed — run backend/sql/business_funding.sql in the Supabase SQL editor.' })
+      }
+    }
 
     // The funder's real name comes from their own profile, not the request body
     // (older clients sent the literal 'Anonymous' here when hiding their name).
     let funderName = typeof req.body.funderName === 'string' && req.body.funderName.trim() && req.body.funderName !== 'Anonymous'
       ? req.body.funderName.trim()
       : null
-    if (userId) {
+    if (userId && fundedAs === 'business') {
+      // A business funds under its organisation's name.
+      funderName = await getOrgName(userId)
+    } else if (userId) {
       const { data: profile } = await supabase
         .from('profiles')
         .select('display_name')
@@ -124,6 +140,7 @@ router.post('/', async (req, res) => {
         publicAttribution,
         userId,
         verificationStatus: 'pending',
+        fundedAs,
       }))
     } catch (e) {
       console.error('[POST /api/fund]', e.message)

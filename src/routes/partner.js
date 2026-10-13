@@ -49,7 +49,7 @@ const { sendAccountCreatedEmail } = require('../services/emailService')
 const { withSignedUrls, signEvidencePath, BUCKET: EVIDENCE_BUCKET } = require('../services/evidenceUrls')
 const { parseTreeSheet, templateCsv, MAX_ROWS } = require('../services/treeImport')
 const { parseDonorSheet, templateCsv: donorTemplateCsv } = require('../services/donorImport')
-const { recordFunding } = require('../services/funding')
+const { recordFunding, fundedAsAvailable } = require('../services/funding')
 const { syncProjectStats } = require('../services/projectStats')
 const treeTasks = require('../services/treeTasks')
 const { treeHistory, treeSummaries, allTasksFor } = require('../services/treeHistory')
@@ -916,11 +916,13 @@ router.get('/funders', requirePartner, async (req, res) => {
 
     // Three reads that each key off projectIds alone — none depends on
     // another's result, so they run concurrently.
+    // funded_as (business_funding.sql) says whose funding a row is; read it once it exists.
+    const withFundedAs = await fundedAsAvailable()
     const [{ data: projects }, { data: fundings, error }, { data: delivered }] = await Promise.all([
       supabase.from('projects').select('id, name').in('id', projectIds),
       supabase
         .from('individual_fundings')
-        .select('id, user_id, project_id, trees_funded, amount_paid, funded_at, public_attribution, funder_name')
+        .select(`id, user_id, project_id, trees_funded, amount_paid, funded_at, public_attribution, funder_name${withFundedAs ? ', funded_as' : ''}`)
         .in('project_id', projectIds)
         .order('funded_at', { ascending: false }),
       // Funded vs delivered vs outstanding — delivered counts approved evidence
@@ -956,7 +958,8 @@ router.get('/funders', requirePartner, async (req, res) => {
         id:          f.id,
         name:        realName || 'Unknown',
         rawName:     realName,
-        type:        roleMap[f.user_id] === 'business' ? 'business' : 'individual',
+        // The row says whose funding it is; older databases fall back to the profile's role.
+        type:        (f.funded_as || roleMap[f.user_id]) === 'business' ? 'business' : 'individual',
         project:     projectMap[f.project_id] || 'Unknown',
         treesFunded: f.trees_funded || 0,
         amountPaid:  f.amount_paid != null
