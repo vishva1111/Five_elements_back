@@ -3,6 +3,7 @@ const router = express.Router()
 const supabase = require('../supabaseClient')
 const { requireRole } = require('../middleware/auth')
 const { replyIfMissingSchema, getOrgName } = require('../services/businessOrg')
+const { fundingScope } = require('../services/funding')
 
 // Business Reports Centre only (ProtectedRoute allows 'business'). Every query
 // is scoped to owner_id = the signed-in account.
@@ -114,10 +115,11 @@ router.get('/:id', async (req, res) => {
     if (error) throw error
     if (!report) return res.status(404).json({ error: 'Report not found' })
 
-    let q = supabase
+    const scope = await fundingScope('business')
+    let q = scope(supabase
       .from('individual_fundings')
       .select('id, project_id, trees_funded, amount_paid, funded_at, verification_status, projects(name)')
-      .eq('user_id', req.userId)
+      .eq('user_id', req.userId))
       .order('funded_at', { ascending: false })
     const range = periodRange(report.period)
     if (range) q = q.gte('funded_at', range[0]).lt('funded_at', range[1])

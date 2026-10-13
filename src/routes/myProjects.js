@@ -11,13 +11,15 @@
 const express = require('express')
 const router  = express.Router()
 const supabase = require('../supabaseClient')
+const { fundingScope } = require('../services/funding')
 
 router.get('/', async (req, res) => {
   try {
     const userId = req.userId
 
-    // Fetch fundings for this user, joined with project data
-    const { data, error } = await supabase
+    // Fetch this user's own (personal) fundings, joined with project data
+    const scope = await fundingScope('individual')
+    const { data, error } = await scope(supabase
       .from('individual_fundings')
       .select(`
         id,
@@ -39,7 +41,7 @@ router.get('/', async (req, res) => {
           tco2e
         )
       `)
-      .eq('user_id', userId)
+      .eq('user_id', userId))
       .order('funded_at', { ascending: false })
 
     if (error) throw error

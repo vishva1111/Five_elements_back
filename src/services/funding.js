@@ -14,10 +14,39 @@
  */
 const supabase = require('../supabaseClient')
 const { syncProjectStats } = require('./projectStats')
+const { isMissingSchema } = require('./businessOrg')
 
 // Estimated CO₂ a funded tree will absorb — same default fund.js has always used.
 // (projects.tco2e now holds verified CO₂ only, so it can't be the basis for this.)
 const FUNDED_TCO2E_PER_TREE = 0.017
+
+// individual_fundings.funded_as ('individual' | 'business') arrives with
+// backend/sql/business_funding.sql. Until that's run every row is personal and
+// both panels keep reading all of an account's rows, exactly as before.
+let fundedAsReady = false
+async function fundedAsAvailable() {
+  if (fundedAsReady) return true
+  const { error } = await supabase.from('individual_fundings').select('funded_as').limit(1)
+  if (!error) fundedAsReady = true
+  // Only a missing column means "not yet" — a passing network error doesn't.
+  return fundedAsReady || !isMissingSchema(error)
+}
+
+/**
+ * A filter narrowing an individual_fundings query to one side of an account:
+ * its own personal funding ('individual') or its organisation's ('business').
+ * Returns a function rather than the query — a query builder is thenable, so
+ * handing it back from an async function would run it.
+ *
+ *   const scope = await fundingScope('business')
+ *   const { data } = await scope(supabase.from('individual_fundings').select(...))
+ */
+async function fundingScope(as) {
+  if (!(await fundedAsAvailable())) return q => q
+  return as === 'business'
+    ? q => q.eq('funded_as', 'business')
+    : q => q.neq('funded_as', 'business')
+}
 
 async function recordFunding({
   project,
@@ -28,6 +57,7 @@ async function recordFunding({
   fundedAt = null,
   verificationStatus = 'pending',
   amountPaid = null,
+  fundedAs = 'individual',
 }) {
   const tCO2e = Number((trees * FUNDED_TCO2E_PER_TREE).toFixed(4))
 
@@ -72,6 +102,9 @@ async function recordFunding({
         // The real name is always kept here so the partner and admin can see
         // who funded; public_attribution decides what public surfaces show.
         funder_name:        funderName,
+        // Personal rows rely on the column default, so they still insert
+        // before business_funding.sql has been run.
+        ...(fundedAs === 'business' ? { funded_as: 'business' } : {}),
       })
       .select('id')
       .single()
@@ -89,4 +122,4 @@ async function recordFunding({
   return { orderId, tCO2e, fundingRowId }
 }
 
-module.exports = { recordFunding }
+module.exports = { recordFunding, fundingScope, fundedAsAvailable }

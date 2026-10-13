@@ -1,6 +1,7 @@
 const express = require('express')
 const router = express.Router()
 const supabase = require('../supabaseClient')
+const { fundingScope } = require('../services/funding')
 
 const TCO2E_PER_TREE = 0.017
 
@@ -11,10 +12,11 @@ const TCO2E_PER_TREE = 0.017
  */
 router.get('/', async (req, res) => {
   try {
-    const { data: fundings, error } = await supabase
+    const scope = await fundingScope('business')
+    const { data: fundings, error } = await scope(supabase
       .from('individual_fundings')
       .select('project_id, trees_funded, amount_paid, funded_at, verification_status')
-      .eq('user_id', req.userId)
+      .eq('user_id', req.userId))
     if (error) throw error
 
     const byProject = new Map()
