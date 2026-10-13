@@ -10,7 +10,8 @@ const { sendTeamInviteEmail } = require('../services/emailService')
 // change another business's team.
 router.use(requireRole('business', 'admin'))
 
-const ROLES = ['Admin', 'Editor', 'Viewer']
+// Business team members are Viewers only (Admin / Editor were removed).
+const ROLES = ['Viewer']
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 /**
@@ -42,11 +43,11 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const email = String(req.body.email || '').trim().toLowerCase()
-    const role  = ROLES.find(r => r.toLowerCase() === String(req.body.role || '').toLowerCase())
+    const role  = ROLES.find(r => r.toLowerCase() === String(req.body.role || 'Viewer').toLowerCase())
     const name  = String(req.body.name || '').trim() || email.split('@')[0]
 
     if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Enter a valid email address' })
-    if (!role) return res.status(400).json({ error: 'Role must be Admin, Editor or Viewer' })
+    if (!role) return res.status(400).json({ error: 'Team members can only be added as Viewer' })
 
     const { data: existing, error: exErr } = await supabase
       .from('team_members')
