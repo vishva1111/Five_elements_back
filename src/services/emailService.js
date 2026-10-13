@@ -367,6 +367,8 @@ const escHtml = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;',
 /** A business added this person to their team. Never throws — the member row stands either way. */
 async function sendTeamInviteEmail({ toEmail, toName, orgName, inviterName, role }) {
   const appUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
+  // sendBrevoEmail quietly skips when no key is set — report that as "not emailed".
+  if (!process.env.BREVO_API_KEY) return false
   try {
     await sendBrevoEmail({
       toEmail,
