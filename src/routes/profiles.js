@@ -150,8 +150,11 @@ router.get('/:slug', async (req, res) => {
       0, 0, 0, 0,
     ]
 
-    // 9. Share URL
-    const shareUrl = `https://carm.fiveelements.earth/profile/${profile.slug || profile.id}`
+    // 9. Share URL — use FRONTEND_URL env var so localhost dev and production
+    // both generate a working link. Falls back to the production domain only
+    // if the env var is not set (e.g. an old deployment without it configured).
+    const frontendBase = (process.env.FRONTEND_URL || 'https://carm.fiveelements.earth').replace(/\/$/, '')
+    const shareUrl = `${frontendBase}/profile/${profile.slug || profile.id}`
 
     res.json({
       id: profile.id,
