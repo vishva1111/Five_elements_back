@@ -147,6 +147,93 @@ router.get('/:slug', async (req, res) => {
     if (!data) return res.status(404).json({ error: 'Project not found' })
 
     const p = data
+
+    // Fetch approved ledger entries, tree GPS, geofence, and monitoring photos in parallel
+    const [ledgerRes, treeRes, fenceRes, monitorRes] = await Promise.all([
+      supabase
+        .from('ledger_entries')
+        .select('id, date, approved_at, trees_verified, co2e_verified, tx_hash, public_hash')
+        .eq('project_id', p.id)
+        .is('superseded_by', null)
+        .gt('trees_verified', 0)
+        .order('approved_at', { ascending: false }),
+      supabase
+        .from('tree_records')
+        .select('id, species, latitude, longitude, submitted_at')
+        .eq('project_id', p.id)
+        .not('latitude', 'is', null)
+        .not('longitude', 'is', null)
+        .limit(100),
+      supabase
+        .from('project_geofences')
+        .select('coordinates, area_sq_m, status')
+        .eq('project_id', p.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+      supabase
+        .from('tree_monitoring_records')
+        .select('id, tree_id, photo_url, photo_urls, latitude, longitude, survey_date, tree_condition')
+        .eq('project_id', p.id)
+        .not('photo_url', 'is', null)
+        .order('survey_date', { ascending: false })
+        .limit(20),
+    ])
+
+    const ledgerRows  = ledgerRes.data  || []
+    const treeRows    = treeRes.data    || []
+    const fenceRow    = fenceRes.data   || null
+    const monitorRows = monitorRes.data || []
+
+    // Parse fencing polygon: array of {latitude, longitude} → [[lat, lng], ...]
+    let fencingPolygon = null
+    if (fenceRow && fenceRow.coordinates) {
+      try {
+        const coords = typeof fenceRow.coordinates === 'string'
+          ? JSON.parse(fenceRow.coordinates)
+          : fenceRow.coordinates
+        if (Array.isArray(coords) && coords.length >= 3) {
+          fencingPolygon = {
+            points: coords
+              .sort((a, b) => (a.corner_index || 0) - (b.corner_index || 0))
+              .map(c => [c.latitude, c.longitude]),
+            areaSqM: fenceRow.area_sq_m,
+            status: fenceRow.status,
+          }
+        }
+      } catch (_) { /* ignore parse errors */ }
+    }
+
+    const evidenceEntries = ledgerRows.map(l => ({
+      id:        l.id,
+      projectId: p.id,
+      date:      l.approved_at || l.date,
+      photoUrl:  null,
+      lat:       null,
+      lng:       null,
+      species:   null,
+      treeCount: l.trees_verified || 0,
+      txHash:    l.tx_hash || l.public_hash || null,
+      verified:  true,
+    }))
+
+    const evidenceLocations = treeRows.map(t => ({
+      lat:   t.latitude,
+      lng:   t.longitude,
+      label: t.species || 'Tree',
+    }))
+
+    const monitoringPhotos = monitorRows.map(m => ({
+      id:          m.id,
+      treeId:      m.tree_id,
+      photoUrl:    m.photo_url,
+      photoUrls:   Array.isArray(m.photo_urls) ? m.photo_urls : [],
+      lat:         m.latitude  ?? null,
+      lng:         m.longitude ?? null,
+      surveyDate:  m.survey_date,
+      condition:   m.tree_condition || null,
+    }))
+
     res.json({
       id: p.id,
       slug: p.slug,
@@ -170,6 +257,10 @@ router.get('/:slug', async (req, res) => {
       status: p.status,
       createdAt: p.created_at,
       coverImage: p.cover_image || null,
+      evidenceEntries,
+      evidenceLocations,
+      fencingPolygon,
+      monitoringPhotos,
     })
   } catch (err) {
     console.error('[GET /api/projects/:slug]', err.message)
