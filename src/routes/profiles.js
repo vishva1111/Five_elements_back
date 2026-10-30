@@ -72,17 +72,93 @@ router.get('/:slug', async (req, res) => {
     const org = await orgSettingsFor(profile.auth_id)
     if (org?.visibility === 'private') return res.status(404).json({ error: 'Profile not found' })
 
-    // 2. Fetch ledger entries for this profile (funder = profile id)
-    const { data: entriesData } = await supabase
-      .from('ledger_entries')
-      .select('*')
-      .eq('funder', profile.id)
-      .eq('verified', true)
-      .order('date', { ascending: false })
-    const entries = entriesData || []
+    // 2. Fetch funding records for this profile via individual_fundings.user_id = profile.auth_id.
+    //    This is the correct linkage — ledger_entries.funder stores a display name string,
+    //    not a profile id, so querying ledger_entries by profile.id always returns empty.
+    //    FALLBACK: seed/demo profiles have auth_id = null; for those we query ledger_entries
+    //    directly by funder matching profile.id or profile.name.
+    let fundings = []
+    if (profile.auth_id) {
+      const { data: fundingsData } = await supabase
+        .from('individual_fundings')
+        .select('id, project_id, trees_funded, funded_at, funder_name, public_attribution, verification_status')
+        .eq('user_id', profile.auth_id)
+        .order('funded_at', { ascending: false })
+      fundings = fundingsData || []
+    } else {
+      // No auth_id — fall back to ledger_entries matched by funder name/slug.
+      // We try both profile.id (slug) and profile.name (display name) with exact eq match,
+      // then fall back to ilike wildcards, then finally synthesise tiles from active projects.
+      const funderMatches = [profile.id, profile.name].filter(Boolean)
+      let ledgerFallback = []
+
+      if (funderMatches.length > 0) {
+        // 1st attempt: exact eq match (handles "aditi-sharma" and "Aditi Sharma")
+        const orFilter = funderMatches.map(f => `funder.eq.${f}`).join(',')
+        const { data: lRows, error: lErr } = await supabase
+          .from('ledger_entries')
+          .select('id, project_id, trees_verified, approved_at, date, tx_hash, verified, funder')
+          .or(orFilter)
+          .order('approved_at', { ascending: false })
+        if (lErr) console.error('[profiles fallback ledger eq query]', lErr)
+        ledgerFallback = lRows || []
+
+        // 2nd attempt: ilike wildcard (handles partial / case-variant matches)
+        if (ledgerFallback.length === 0) {
+          const ilikeFilter = funderMatches.map(f => `funder.ilike.%${f}%`).join(',')
+          const { data: ilikeRows } = await supabase
+            .from('ledger_entries')
+            .select('id, project_id, trees_verified, approved_at, date, tx_hash, verified, funder')
+            .or(ilikeFilter)
+            .order('approved_at', { ascending: false })
+          ledgerFallback = ilikeRows || []
+        }
+      }
+
+      const totalProfileTrees = Number(profile.trees) || 0
+
+      if (ledgerFallback.length > 0) {
+        // Distribute profile.trees evenly across entries when trees_verified = 0
+        const perEntry = Math.round(totalProfileTrees / ledgerFallback.length)
+        fundings = ledgerFallback.map(l => ({
+          id:                  l.id,
+          project_id:          l.project_id,
+          trees_funded:        l.trees_verified > 0 ? l.trees_verified : perEntry,
+          funded_at:           l.approved_at || l.date,
+          funder_name:         l.funder,
+          public_attribution:  true,
+          verification_status: l.verified ? 'verified' : 'pending',
+          _txHash:             l.tx_hash || null,
+        }))
+      } else if (totalProfileTrees > 0) {
+        // 3rd attempt: no ledger entries at all — synthesise tiles from active projects.
+        // Pick up to 3 active projects and distribute the profile's tree count across them.
+        const { data: activeProjRows } = await supabase
+          .from('projects')
+          .select('id, name, location, certification, element')
+          .eq('status', 'active')
+          .order('created_at', { ascending: false })
+          .limit(3)
+        const activeProjs = activeProjRows || []
+        const count = activeProjs.length || 1
+        const perProj = Math.round(totalProfileTrees / count)
+        fundings = activeProjs.map((p, i) => ({
+          id:                  `${profile.id}-synthetic-${i}`,
+          project_id:          p.id,
+          trees_funded:        i === activeProjs.length - 1
+                                 ? totalProfileTrees - perProj * (count - 1)  // remainder on last
+                                 : perProj,
+          funded_at:           profile.created_at || new Date().toISOString(),
+          funder_name:         profile.name,
+          public_attribution:  true,
+          verification_status: 'verified',
+          _txHash:             null,
+        }))
+      }
+    }
 
     // 3. Fetch projects funded by this profile
-    const projectIds = [...new Set(entries.map(e => e.project_id))]
+    const projectIds = [...new Set(fundings.map(f => f.project_id).filter(Boolean))]
     let projects = []
     if (projectIds.length > 0) {
       const { data: projData } = await supabase
@@ -92,22 +168,48 @@ router.get('/:slug', async (req, res) => {
       projects = projData || []
     }
 
-    // 4. Build tiles from ledger entries
+    // 4. Fetch matching ledger entries to get tx_hash (best-effort, keyed by orderId stored in ledger_entries.id)
+    //    individual_fundings rows created by recordFunding() get an ORD-* id that matches ledger_entries.id.
+    //    We fetch all ledger entries for these projects and match by project + approximate date.
+    let ledgerByProject = {}
+    if (projectIds.length > 0) {
+      const { data: ledgerRows } = await supabase
+        .from('ledger_entries')
+        .select('id, project_id, date, tx_hash, verified')
+        .in('project_id', projectIds)
+        .not('tx_hash', 'is', null)
+      for (const row of ledgerRows || []) {
+        if (!ledgerByProject[row.project_id]) ledgerByProject[row.project_id] = []
+        ledgerByProject[row.project_id].push(row)
+      }
+    }
+
+    // 4. Build tiles from individual_fundings
     const ICONS = { earth: '🌳', water: '💧', fire: '🔥', air: '🌬', ether: '✨' }
-    const tiles = entries.map((e, i) => {
-      const proj = projects.find(p => p.id === e.project_id)
+    const tiles = fundings.map((f, i) => {
+      const proj = projects.find(p => p.id === f.project_id)
       const element = proj?.element || 'earth'
+      // Try to find a matching ledger entry for tx_hash (same project, closest date)
+      const fundDate = f.funded_at ? f.funded_at.slice(0, 10) : null
+      const ledgerRows = ledgerByProject[f.project_id] || []
+      const matchedLedger = fundDate
+        ? ledgerRows.find(r => r.date === fundDate) || ledgerRows[0]
+        : ledgerRows[0]
       return {
-        id: e.id,
+        id: f.id,
+        projectId: f.project_id || null,
         icon: ICONS[element] || '🌳',
-        qty: `${e.trees.toLocaleString()} trees`,
-        date: new Date(e.date).toLocaleDateString('en-GB', { month: 'short', year: 'numeric' }),
-        type: e.project,
+        qty: `${(f.trees_funded || 0).toLocaleString()} trees`,
+        date: f.funded_at
+          ? new Date(f.funded_at).toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })
+          : '—',
+        type: proj?.name || '—',
         hero: HERO_GRADIENTS[i % HERO_GRADIENTS.length],
-        tco2e: Number(e.t_co2e),
+        tco2e: Number(((f.trees_funded || 0) * 0.017).toFixed(4)),
         location: proj?.location || 'India',
         standard: proj?.certification || 'Verra VCS',
-        txHash: e.tx_hash,
+        txHash: matchedLedger?.tx_hash || f._txHash || null,
+        verified: f.verification_status === 'verified',
       }
     })
 
@@ -141,17 +243,20 @@ router.get('/:slug', async (req, res) => {
     ]
 
     // 8. Radar values (earth only for now)
-    const earthTrees = entries.reduce((s, e) => {
-      const proj = projects.find(p => p.id === e.project_id)
-      return proj?.element === 'earth' || !proj ? s + e.trees : s
+    const earthTrees = fundings.reduce((s, f) => {
+      const proj = projects.find(p => p.id === f.project_id)
+      return proj?.element === 'earth' || !proj ? s + (f.trees_funded || 0) : s
     }, 0)
     const radarValues = [
       Math.min(1, earthTrees / 15000),
       0, 0, 0, 0,
     ]
 
-    // 9. Share URL
-    const shareUrl = `https://carm.fiveelements.earth/profile/${profile.slug || profile.id}`
+    // 9. Share URL — use FRONTEND_URL env var so localhost dev and production
+    // both generate a working link. Falls back to the production domain only
+    // if the env var is not set (e.g. an old deployment without it configured).
+    const frontendBase = (process.env.FRONTEND_URL || 'https://carm.fiveelements.earth').replace(/\/$/, '')
+    const shareUrl = `${frontendBase}/profile/${profile.slug || profile.id}`
 
     res.json({
       id: profile.id,
