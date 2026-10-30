@@ -264,7 +264,7 @@ router.get('/:slug', async (req, res) => {
       displayName: org?.org_name || profile.name,
       bio: org?.tagline || profile.bio || '',
       metaLine: [profile.location, profile.type, profile.member_since ? `Member since ${profile.member_since}` : null].filter(Boolean).join(' · '),
-      isOrg: profile.is_org || false,
+      isOrg: profile.is_org || profile.type?.toLowerCase() === 'business',
       website: org?.website || profile.website || null,
       shareNote: profile.share_note || 'Share your verified climate action.',
       shareUrl,
