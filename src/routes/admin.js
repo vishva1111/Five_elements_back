@@ -254,6 +254,55 @@ router.post('/change-requests/:source/:id/:decision', requireAdmin, async (req, 
   }
 })
 
+// ─── A2: Evidence review list ─────────────────────────────────────────────────
+// GET /api/admin/evidence?status=pending_review|approved|rejected|all
+// Every evidence file, not only pending ones (the Approval queue covers those),
+// plus per-status counts for the tabs.
+const EVIDENCE_STATUSES = ['pending_review', 'approved', 'rejected']
+
+router.get('/evidence', requireAdmin, async (req, res) => {
+  try {
+    const status = EVIDENCE_STATUSES.includes(req.query.status) ? req.query.status : 'all'
+
+    let query = supabase
+      .from('evidence_files')
+      .select('id, file_name, file_type, file_size, status, review_notes, uploaded_at, project_submissions(submitted_by, title, element, tree_count)')
+      .order('uploaded_at', { ascending: false })
+      .limit(500)
+    if (status !== 'all') query = query.eq('status', status)
+
+    const head = { count: 'exact', head: true }
+    const [{ data, error }, ...countRes] = await Promise.all([
+      query,
+      ...EVIDENCE_STATUSES.map(s => supabase.from('evidence_files').select('id', head).eq('status', s)),
+    ])
+    if (error) throw error
+
+    const names = await submitterNames((data || []).map(e => e.project_submissions?.submitted_by))
+    const items = (data || []).map(e => {
+      const sub = e.project_submissions
+      return {
+        id:          e.id,
+        title:       sub?.title || 'Evidence submission',
+        fileName:    e.file_name || 'file',
+        fileType:    e.file_type || '',
+        size:        e.file_size ? `${Math.round(e.file_size / 1024)} KB` : '—',
+        submittedBy: (sub?.submitted_by && (names[sub.submitted_by] || sub.submitted_by)) || '—',
+        uploadedAt:  e.uploaded_at || null,
+        element:     sub?.element || '',
+        treeCount:   sub?.tree_count || 0,
+        status:      e.status || 'pending_review',
+        reviewNotes: e.review_notes || '',
+      }
+    })
+
+    const counts = Object.fromEntries(EVIDENCE_STATUSES.map((s, i) => [s, countRes[i].count || 0]))
+    res.json({ items, counts })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // ─── A2: Evidence review detail ───────────────────────────────────────────────
 // GET /api/admin/evidence/:id
 router.get('/evidence/:id', requireAdmin, async (req, res) => {
@@ -317,11 +366,15 @@ router.post('/evidence/:id/approve', requireAdmin, async (req, res) => {
     // Fetch evidence + submission + project
     const { data: ev } = await supabase
       .from('evidence_files')
-      .select('submission_id, project_submissions(project_id, submitted_by, title)')
+      .select('submission_id, status, project_submissions(project_id, submitted_by, title)')
       .eq('id', id)
       .single()
 
     if (!ev) return res.status(404).json({ error: 'Evidence not found' })
+    // Approving twice would write a second ledger entry and double-count the trees
+    if (ev.status && ev.status !== 'pending_review') {
+      return res.status(409).json({ error: `This evidence is already ${ev.status}.` })
+    }
 
     const projectId = ev.project_submissions?.project_id
     const publicHash = crypto.randomBytes(16).toString('hex')
@@ -394,11 +447,16 @@ router.post('/evidence/:id/reject', requireAdmin, async (req, res) => {
 
     const { data: ev } = await supabase
       .from('evidence_files')
-      .select('submission_id, project_submissions(submitted_by)')
+      .select('submission_id, status, project_submissions(submitted_by)')
       .eq('id', id)
       .single()
 
     if (!ev) return res.status(404).json({ error: 'Evidence not found' })
+    // An approved one already has a public ledger entry; rejecting it now would
+    // leave that entry behind — corrections go through Ledger admin instead.
+    if (ev.status && ev.status !== 'pending_review') {
+      return res.status(409).json({ error: `This evidence is already ${ev.status}.` })
+    }
 
     await supabase.from('evidence_files').update({ status: 'rejected', review_notes: reviewNotes }).eq('id', id)
     await supabase.from('project_submissions').update({ status: 'rejected', review_notes: reviewNotes }).eq('id', ev.submission_id)
